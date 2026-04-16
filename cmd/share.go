@@ -1,0 +1,75 @@
+package cmd
+
+import (
+	"fmt"
+	"os"
+	"time"
+
+	"github.com/ashutoshsinghai/punch/internal/ip"
+	"github.com/ashutoshsinghai/punch/internal/punch"
+	"github.com/ashutoshsinghai/punch/internal/token"
+	"github.com/spf13/cobra"
+)
+
+var (
+	shareExpire string
+	shareFormat string
+)
+
+var shareCmd = &cobra.Command{
+	Use:   "share",
+	Short: "Start a session and print a token for your peer",
+	RunE:  runShare,
+}
+
+func init() {
+	shareCmd.Flags().StringVar(&shareExpire, "expire", "10m", "Token expiry duration (e.g. 10m, 30m, 1h)")
+	shareCmd.Flags().StringVar(&shareFormat, "token", "words", "Token format: words | base58")
+	rootCmd.AddCommand(shareCmd)
+}
+
+func runShare(_ *cobra.Command, _ []string) error {
+	expiry, err := time.ParseDuration(shareExpire)
+	if err != nil {
+		return fmt.Errorf("invalid expiry %q: %w", shareExpire, err)
+	}
+
+	fmt.Fprintln(os.Stderr, "Discovering IPs...")
+	publicIP, err := ip.Public()
+	if err != nil {
+		return fmt.Errorf("could not get public IP: %w", err)
+	}
+	localIP, _ := ip.Local()
+
+	port, err := punch.RandomPort()
+	if err != nil {
+		return fmt.Errorf("could not allocate port: %w", err)
+	}
+
+	payload, err := token.NewPayload(publicIP, localIP, port, expiry)
+	if err != nil {
+		return fmt.Errorf("could not create token: %w", err)
+	}
+
+	tok, err := token.Encode(payload)
+	if err != nil {
+		return fmt.Errorf("could not encode token: %w", err)
+	}
+
+	display := tok
+	if shareFormat == "words" {
+		display = token.Words(tok)
+	}
+
+	fmt.Printf("\nToken: %s\n", display)
+	fmt.Printf("Send this to your peer. Expires in %s.\n\n", expiry)
+	fmt.Fprintln(os.Stderr, "Waiting for connection...")
+
+	result, err := punch.Listen(port)
+	if err != nil {
+		return err
+	}
+
+	fmt.Fprintf(os.Stderr, "Connected to %s. Direct P2P. No server.\n\n", result.Remote)
+	return runChat(result, payload.SessionHex())
+}

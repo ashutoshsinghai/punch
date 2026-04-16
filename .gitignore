@@ -1,0 +1,15 @@
+# binaries
+punch
+punch-linux-arm64
+punch-darwin-*
+punch-windows-*
+dist/
+
+# Go
+*.test
+*.out
+vendor/
+
+# OS
+.DS_Store
+PRD.md
