@@ -31,7 +31,17 @@ func Local() (string, error) {
 // Public returns the machine's public IPv4 address.
 // Tries multiple providers; returns the first success.
 func Public() (string, error) {
-	client := &http.Client{Timeout: 5 * time.Second}
+	// Force IPv4 transport so providers return an IPv4 address even on
+	// dual-stack or IPv6-only networks (e.g. mobile hotspots).
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			DialContext: (&net.Dialer{}).DialContext,
+			Dial: func(network, addr string) (net.Conn, error) {
+				return net.Dial("tcp4", addr)
+			},
+		},
+	}
 
 	for _, url := range lookupURLs {
 		ip, err := fetch(client, url)
