@@ -117,6 +117,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return nil
 			}
 
+		case tea.KeySpace:
+			m.input += " "
+
 		case tea.KeyBackspace, tea.KeyDelete:
 			if len(m.input) > 0 {
 				m.input = m.input[:len(m.input)-1]

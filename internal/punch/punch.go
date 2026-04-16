@@ -84,20 +84,37 @@ func Listen(localPort uint16) (*Result, error) {
 // to the public IP for cross-network connections.
 func Dial(publicIP, localIP string, remotePort uint16) (*Result, error) {
 	candidates := dedupIPs(localIP, publicIP)
+	if len(candidates) == 0 {
+		return nil, fmt.Errorf("no remote addresses to try")
+	}
 
-	var lastErr error
+	type dialResult struct {
+		result *Result
+		err    error
+		label  string
+	}
+
+	ch := make(chan dialResult, len(candidates))
+
 	for i, ipStr := range candidates {
 		label := "public"
 		if i == 0 && localIP != "" && localIP != publicIP {
 			label = "local"
 		}
 		fmt.Fprintf(os.Stderr, "Trying %s address (%s)...\n", label, ipStr)
+		go func(ip, lbl string) {
+			r, err := dialOne(ip, remotePort)
+			ch <- dialResult{result: r, err: err, label: lbl}
+		}(ipStr, label)
+	}
 
-		result, err := dialOne(ipStr, remotePort)
-		if err == nil {
-			return result, nil
+	var lastErr error
+	for range candidates {
+		dr := <-ch
+		if dr.err == nil {
+			return dr.result, nil
 		}
-		lastErr = err
+		lastErr = dr.err
 	}
 
 	return nil, fmt.Errorf(
