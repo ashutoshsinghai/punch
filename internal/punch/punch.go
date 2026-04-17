@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"syscall"
 	"time"
 
 	"github.com/ashutoshsinghai/punch/internal/transport"
@@ -214,16 +215,50 @@ func BindSocket() (*net.UDPConn, error) {
 	return conn, nil
 }
 
+// enableBroadcast sets SO_BROADCAST on conn so we can send to 255.255.255.255.
+func enableBroadcast(conn *net.UDPConn) {
+	rc, err := conn.SyscallConn()
+	if err != nil {
+		return
+	}
+	rc.Control(func(fd uintptr) { //nolint:errcheck
+		syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_BROADCAST, 1) //nolint:errcheck
+	})
+}
+
+// isPrivateIP returns true for RFC-1918 / link-local addresses (LAN peers).
+func isPrivateIP(ip net.IP) bool {
+	ip = ip.To4()
+	if ip == nil {
+		return false
+	}
+	switch {
+	case ip[0] == 10:
+		return true
+	case ip[0] == 172 && ip[1] >= 16 && ip[1] <= 31:
+		return true
+	case ip[0] == 192 && ip[1] == 168:
+		return true
+	case ip[0] == 169 && ip[1] == 254:
+		return true
+	}
+	return false
+}
+
 // Simultaneous performs true simultaneous UDP hole punching.
 // Both peers must know each other's public IP:port in advance (via token
 // exchange) and call Simultaneous at roughly the same time.
 //
-// Bob should call this immediately after printing his reply token so that
-// his probes keep the NAT hole open while Alice reads the token.
-// Alice calls it after entering Bob's reply token.
-// Once both sides are probing each other the holes open and they connect.
+// If both peers are on the same LAN (same public IP / NAT hairpin not
+// supported), it falls back to a LAN broadcast probe automatically —
+// no token format change required.
 func Simultaneous(conn *net.UDPConn, remote *net.UDPAddr) (*Result, error) {
 	const timeout = 10 * time.Minute
+
+	// Enable broadcast so we can also probe 255.255.255.255:remote.Port
+	// for peers behind the same NAT.
+	enableBroadcast(conn)
+	bcast := &net.UDPAddr{IP: net.IPv4bcast, Port: remote.Port}
 
 	deadline := time.Now().Add(timeout)
 	ticker := time.NewTicker(probeInterval)
@@ -236,6 +271,7 @@ func Simultaneous(conn *net.UDPConn, remote *net.UDPAddr) (*Result, error) {
 		select {
 		case <-ticker.C:
 			conn.WriteToUDP(probe, remote) //nolint:errcheck
+			conn.WriteToUDP(probe, bcast)  //nolint:errcheck — LAN fallback
 		default:
 		}
 
@@ -245,22 +281,26 @@ func Simultaneous(conn *net.UDPConn, remote *net.UDPAddr) (*Result, error) {
 			continue
 		}
 
-		if from.String() == remote.String() &&
-			n >= len(probeMsg) && string(buf[:len(probeMsg)]) == probeMsg {
-			conn.SetReadDeadline(time.Time{})
-			local := conn.LocalAddr().(*net.UDPAddr)
-			tc := transport.Wrap(conn, remote)
-			// Keep probing for a short window so the peer can also exit
-			// their Simultaneous loop — they may not have received our
-			// probe yet when we return here.
-			go func() {
-				for i := 0; i < 20; i++ {
-					conn.WriteToUDP(probe, remote) //nolint:errcheck
-					time.Sleep(probeInterval)
-				}
-			}()
-			return &Result{Conn: tc, Local: local, Remote: remote}, nil
+		if n < len(probeMsg) || string(buf[:len(probeMsg)]) != probeMsg {
+			continue
 		}
+
+		// Accept the probe if it's from the expected public address OR
+		// from a private/LAN address (same-network fallback).
+		if from.String() != remote.String() && !isPrivateIP(from.IP) {
+			continue
+		}
+
+		conn.SetReadDeadline(time.Time{})
+		local := conn.LocalAddr().(*net.UDPAddr)
+		tc := transport.Wrap(conn, from) // use actual source (may be LAN IP)
+		go func() {
+			for i := 0; i < 20; i++ {
+				conn.WriteToUDP(probe, from) //nolint:errcheck
+				time.Sleep(probeInterval)
+			}
+		}()
+		return &Result{Conn: tc, Local: local, Remote: from}, nil
 	}
 
 	conn.Close()
