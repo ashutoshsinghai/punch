@@ -40,8 +40,9 @@ const (
 
 	// WindowSize is the number of unacknowledged chunks in flight.
 	// Throughput ≈ WindowSize × ChunkSize / RTT.
-	// 256 × 1400 B = 350 KB in flight → ~2.3 MB/s at 150 ms RTT.
-	WindowSize = 256
+	// 64 × 1400 B = 87 KB in flight; large enough for good throughput
+	// without blowing the NAT's packet buffer.
+	WindowSize = 64
 
 	ackTimeout    = 3 * time.Second  // retransmit window after no ACK
 	transferDeadline = 90 * time.Second // max silence before giving up
