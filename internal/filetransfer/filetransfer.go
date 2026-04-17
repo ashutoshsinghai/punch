@@ -33,7 +33,10 @@ const (
 	typeAbort byte = 0x04
 
 	// ChunkSize is the plaintext payload per DATA packet.
-	ChunkSize = 32 * 1024 // 32 KB
+	// Must fit inside a single UDP datagram after headers + encryption overhead:
+	//   Ethernet MTU 1500 - IP(20) - UDP(8) - pkt header(5) - ChaCha20 overhead(28) = 1439
+	// Use 1400 to leave headroom for PPPoE, VPN tunnels, etc.
+	ChunkSize = 1400
 
 	// WindowSize is the number of unacknowledged chunks in flight.
 	WindowSize = 64
@@ -47,7 +50,7 @@ const headerSize = 5
 
 // maxPacket is the largest packet we ever read: header + encrypted chunk.
 // ChaCha20-Poly1305 overhead is 12 (nonce) + 16 (tag) = 28 bytes.
-const maxPacket = headerSize + ChunkSize + 28 + 16
+const maxPacket = headerSize + ChunkSize + 28
 
 // Send streams the file at filePath to remote using a sliding window protocol.
 // progress(sent, total) is called after each ACKed window advance; may be nil.
