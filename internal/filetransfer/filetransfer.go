@@ -39,7 +39,9 @@ const (
 	ChunkSize = 1400
 
 	// WindowSize is the number of unacknowledged chunks in flight.
-	WindowSize = 64
+	// Throughput ≈ WindowSize × ChunkSize / RTT.
+	// 256 × 1400 B = 350 KB in flight → ~2.3 MB/s at 150 ms RTT.
+	WindowSize = 256
 
 	ackTimeout    = 3 * time.Second  // retransmit window after no ACK
 	transferDeadline = 90 * time.Second // max silence before giving up

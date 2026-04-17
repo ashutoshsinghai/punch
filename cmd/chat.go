@@ -244,6 +244,7 @@ func chatSendFile(path string, chatConn *transport.Conn, cipher *crypto.Cipher, 
 
 	prog.Send(ui.ProgressMsg{Text: fmt.Sprintf("sending %s (%s)...", name, humanBytes(int(total)))})
 
+	ftStart := time.Now()
 	err = filetransfer.Send(ftConn, peerFTAddr, path, cipher, func(sent, tot int64) {
 		if tot == 0 {
 			return
@@ -251,13 +252,15 @@ func chatSendFile(path string, chatConn *transport.Conn, cipher *crypto.Cipher, 
 		pct := int(sent * 100 / tot)
 		prog.Send(ui.ProgressMsg{Text: fmt.Sprintf("%s  %s  %d%%", progressBar(pct), name, pct)})
 	})
+	elapsed := time.Since(ftStart)
 	prog.Send(ui.ProgressMsg{})
 	if err != nil {
 		prog.Send(ui.SystemMsg{Text: fmt.Sprintf("send error (%s): %s", name, err.Error())})
 		filetransfer.Abort(ftConn, peerFTAddr)
 		return
 	}
-	prog.Send(ui.SystemMsg{Text: fmt.Sprintf("sent %s (%s)", name, humanBytes(int(total)))})
+	prog.Send(ui.SystemMsg{Text: fmt.Sprintf("sent %s (%s) in %s  —  %s/s",
+		name, humanBytes(int(total)), elapsed.Round(time.Millisecond), humanBytes(int(float64(total)/elapsed.Seconds())))})
 }
 
 // handleIncomingFileOffer shows a confirmation prompt, waits for the user's decision,
@@ -335,6 +338,7 @@ func handleIncomingFileOffer(offer string, chatConn *transport.Conn, cipher *cry
 	savePath := name
 	absPath, _ := filepath.Abs(savePath)
 
+	ftStart := time.Now()
 	err = filetransfer.Receive(ftConn, senderFTAddr, savePath, size, cipher, func(recv, tot int64) {
 		if tot == 0 {
 			return
@@ -342,12 +346,14 @@ func handleIncomingFileOffer(offer string, chatConn *transport.Conn, cipher *cry
 		pct := int(recv * 100 / tot)
 		prog.Send(ui.ProgressMsg{Text: fmt.Sprintf("%s  %s  %d%%", progressBar(pct), name, pct)})
 	})
+	elapsed := time.Since(ftStart)
 	prog.Send(ui.ProgressMsg{})
 	if err != nil {
 		prog.Send(ui.SystemMsg{Text: fmt.Sprintf("receive error (%s): %s", name, err.Error())})
 		return
 	}
-	prog.Send(ui.SystemMsg{Text: fmt.Sprintf("saved %s → %s", name, absPath)})
+	prog.Send(ui.SystemMsg{Text: fmt.Sprintf("saved %s → %s  (%s in %s  —  %s/s)",
+		name, absPath, humanBytes(int(size)), elapsed.Round(time.Millisecond), humanBytes(int(float64(size)/elapsed.Seconds())))})
 }
 
 // sendChatSignal encrypts and sends a control string over the chat connection.
