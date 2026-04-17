@@ -201,6 +201,15 @@ func Simultaneous(conn *net.UDPConn, remote *net.UDPAddr) (*Result, error) {
 			conn.SetReadDeadline(time.Time{})
 			local := conn.LocalAddr().(*net.UDPAddr)
 			tc := transport.Wrap(conn, remote)
+			// Keep probing for a short window so the peer can also exit
+			// their Simultaneous loop — they may not have received our
+			// probe yet when we return here.
+			go func() {
+				for i := 0; i < 20; i++ {
+					conn.WriteToUDP(probe, remote) //nolint:errcheck
+					time.Sleep(probeInterval)
+				}
+			}()
 			return &Result{Conn: tc, Local: local, Remote: remote}, nil
 		}
 	}
