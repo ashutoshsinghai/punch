@@ -2,11 +2,10 @@ package cmd
 
 import (
 	"bufio"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/user"
@@ -16,7 +15,9 @@ import (
 	"time"
 
 	"github.com/ashutoshsinghai/punch/internal/crypto"
+	"github.com/ashutoshsinghai/punch/internal/filetransfer"
 	"github.com/ashutoshsinghai/punch/internal/punch"
+	"github.com/ashutoshsinghai/punch/internal/stun"
 	"github.com/ashutoshsinghai/punch/internal/transport"
 	"github.com/ashutoshsinghai/punch/ui"
 	tea "github.com/charmbracelet/bubbletea"
@@ -33,10 +34,10 @@ func runChat(result *punch.Result, session, myName, myPublicAddr string) error {
 	localAddr := myPublicAddr
 	remoteAddr := result.Remote.String()
 
-	// confirmCh receives the user's y/N decision for an incoming file request.
+	// confirmCh receives the user's y/N decision for an incoming file offer.
 	confirmCh := make(chan bool, 1)
-	// fileAckCh receives the peer's acceptance/decline of our outgoing file request.
-	fileAckCh := make(chan bool, 1)
+	// ftAcceptCh delivers the peer's FT port on acceptance, or -1 on decline.
+	ftAcceptCh := make(chan int, 1)
 
 	var prog *tea.Program
 
@@ -66,7 +67,7 @@ func runChat(result *punch.Result, session, myName, myPublicAddr string) error {
 
 		case strings.HasPrefix(msg, "/send "):
 			path := strings.TrimSpace(strings.TrimPrefix(msg, "/send "))
-			go chatSendFile(path, result.Conn, cipher, prog, fileAckCh, peerName)
+			go chatSendFile(path, result.Conn, cipher, prog, ftAcceptCh, peerName, result.Remote.IP.String())
 			return nil
 
 		case msg == "__CONFIRM__:yes":
@@ -119,14 +120,25 @@ func runChat(result *punch.Result, session, myName, myPublicAddr string) error {
 				rtt := time.Since(time.Unix(0, nanos))
 				prog.Send(ui.SystemMsg{Text: fmt.Sprintf("pong: %s", rtt.Round(time.Millisecond))})
 
-			case strings.HasPrefix(text, "FILE_REQ:"):
-				// Blocks recv loop until user responds and file is received (or declined).
-				handleIncomingFileReq(text, result.Conn, cipher, prog, confirmCh, peerName)
+			case strings.HasPrefix(text, "FILE_OFFER:"):
+				// Spawn in a goroutine so the recv loop stays alive for chat
+				// messages while the file transfer runs on its own connection.
+				go handleIncomingFileOffer(text, result.Conn, cipher, prog, confirmCh, peerName, result.Remote.IP.String())
 
-			case strings.HasPrefix(text, "FILE_ACK:"):
-				accepted := text == "FILE_ACK:yes"
+			case strings.HasPrefix(text, "FILE_ACCEPT:"):
+				portStr := strings.TrimPrefix(text, "FILE_ACCEPT:")
+				port, err := strconv.Atoi(portStr)
+				if err != nil {
+					port = -1
+				}
 				select {
-				case fileAckCh <- accepted:
+				case ftAcceptCh <- port:
+				default:
+				}
+
+			case text == "FILE_DECLINE":
+				select {
+				case ftAcceptCh <- -1:
 				default:
 				}
 
@@ -143,107 +155,133 @@ func runChat(result *punch.Result, session, myName, myPublicAddr string) error {
 	return nil
 }
 
-// chatSendFile reads a file, sends a FILE_REQ, waits for peer acceptance, then streams chunks.
-func chatSendFile(path string, conn *transport.Conn, cipher *crypto.Cipher, prog *tea.Program, ackCh chan bool, peerName string) {
-	data, err := os.ReadFile(path)
+// chatSendFile announces a file offer over the chat connection, waits for the
+// peer to accept and share their file-transfer port, then opens a dedicated
+// UDP connection and streams the file using the sliding-window protocol.
+func chatSendFile(path string, chatConn *transport.Conn, cipher *crypto.Cipher, prog *tea.Program, ftAcceptCh chan int, peerName, peerChatIP string) {
+	// Stat the file before doing anything.
+	info, err := os.Stat(path)
 	if err != nil {
 		prog.Send(ui.SystemMsg{Text: "send error: " + err.Error()})
 		return
 	}
-
 	name := filepath.Base(path)
-	hash := sha256.Sum256(data)
-	hashHex := hex.EncodeToString(hash[:])
-	total := len(data)
+	total := info.Size()
 
-	// Send the request with metadata — no data yet.
-	req := fmt.Sprintf("FILE_REQ:%s:%d:%s", name, total, hashHex)
-	enc, err := cipher.Encrypt([]byte(req))
+	// Bind a dedicated UDP socket for the file transfer and discover its
+	// public address via STUN so the peer can punch back to us.
+	ftConn, err := punch.BindSocket()
+	if err != nil {
+		prog.Send(ui.SystemMsg{Text: "send error (bind FT socket): " + err.Error()})
+		return
+	}
+	defer ftConn.Close()
+
+	_, ftPublicPort, err := stun.Discover(ftConn)
+	if err != nil {
+		prog.Send(ui.SystemMsg{Text: "send error (STUN for FT): " + err.Error()})
+		return
+	}
+
+	// Announce: FILE_OFFER:<size>:<sender-ft-port>:<name>
+	// Name is last so that filenames containing ':' are parsed correctly.
+	offer := fmt.Sprintf("FILE_OFFER:%d:%d:%s", total, ftPublicPort, name)
+	enc, err := cipher.Encrypt([]byte(offer))
 	if err != nil {
 		prog.Send(ui.SystemMsg{Text: "send error: " + err.Error()})
 		return
 	}
-	if err := conn.Send(enc); err != nil {
+	if err := chatConn.Send(enc); err != nil {
 		prog.Send(ui.SystemMsg{Text: "send error: " + err.Error()})
 		return
 	}
 
-	prog.Send(ui.ProgressMsg{Text: fmt.Sprintf("waiting for %s to accept %s (%s)...", peerName, name, humanBytes(total))})
+	prog.Send(ui.ProgressMsg{Text: fmt.Sprintf("waiting for %s to accept %s (%s)...", peerName, name, humanBytes(int(total)))})
 
-	// Wait for peer's accept/decline (or timeout).
-	var accepted bool
+	// Keep the NAT mapping alive with periodic STUN pings while waiting for
+	// the peer to accept. Most NATs expire idle UDP mappings after 30-60s.
+	stopKeepalive := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(20 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				stun.Discover(ftConn) //nolint:errcheck
+			case <-stopKeepalive:
+				return
+			}
+		}
+	}()
+
+	// Wait for FILE_ACCEPT:<port> or FILE_DECLINE (signalled as -1).
+	var peerFTPort int
 	select {
-	case accepted = <-ackCh:
+	case peerFTPort = <-ftAcceptCh:
 	case <-time.After(60 * time.Second):
+		close(stopKeepalive)
 		prog.Send(ui.ProgressMsg{})
 		prog.Send(ui.SystemMsg{Text: fmt.Sprintf("no response from %s — transfer cancelled", peerName)})
 		return
 	}
+	close(stopKeepalive)
 
-	if !accepted {
+	if peerFTPort < 0 {
 		prog.Send(ui.ProgressMsg{})
 		prog.Send(ui.SystemMsg{Text: fmt.Sprintf("%s declined %s", peerName, name)})
 		return
 	}
 
-	// Accepted — stream the file.
-	const chunkSize = 8192
-	sent := 0
+	peerFTAddr := &net.UDPAddr{IP: net.ParseIP(peerChatIP), Port: peerFTPort}
 
-	for offset := 0; offset < total; offset += chunkSize {
-		end := offset + chunkSize
-		if end > total {
-			end = total
-		}
-		enc, err := cipher.Encrypt(data[offset:end])
-		if err != nil {
-			prog.Send(ui.ProgressMsg{})
-			prog.Send(ui.SystemMsg{Text: "send error: " + err.Error()})
+	// Punch the dedicated connection.
+	prog.Send(ui.ProgressMsg{Text: fmt.Sprintf("opening FT channel to %s...", peerName)})
+	if err := punch.SoloPunch(ftConn, peerFTAddr); err != nil {
+		prog.Send(ui.ProgressMsg{})
+		prog.Send(ui.SystemMsg{Text: "FT punch failed: " + err.Error()})
+		return
+	}
+
+	prog.Send(ui.ProgressMsg{Text: fmt.Sprintf("sending %s (%s)...", name, humanBytes(int(total)))})
+
+	err = filetransfer.Send(ftConn, peerFTAddr, path, cipher, func(sent, tot int64) {
+		if tot == 0 {
 			return
 		}
-		if err := conn.Send(enc); err != nil {
-			prog.Send(ui.ProgressMsg{})
-			prog.Send(ui.SystemMsg{Text: "send error: " + err.Error()})
-			return
-		}
-		sent = end
-		pct := sent * 100 / total
+		pct := int(sent * 100 / tot)
 		prog.Send(ui.ProgressMsg{Text: fmt.Sprintf("%s  %s  %d%%", progressBar(pct), name, pct)})
-	}
-
-	eofEnc, err := cipher.Encrypt([]byte("EOF"))
-	if err != nil {
-		prog.Send(ui.ProgressMsg{})
-		prog.Send(ui.SystemMsg{Text: "send error: " + err.Error()})
-		return
-	}
-	if err := conn.Send(eofEnc); err != nil {
-		prog.Send(ui.ProgressMsg{})
-		prog.Send(ui.SystemMsg{Text: "send error: " + err.Error()})
-		return
-	}
-
+	})
 	prog.Send(ui.ProgressMsg{})
-	prog.Send(ui.SystemMsg{Text: fmt.Sprintf("sent %s (%s)", name, humanBytes(total))})
+	if err != nil {
+		prog.Send(ui.SystemMsg{Text: fmt.Sprintf("send error (%s): %s", name, err.Error())})
+		filetransfer.Abort(ftConn, peerFTAddr)
+		return
+	}
+	prog.Send(ui.SystemMsg{Text: fmt.Sprintf("sent %s (%s)", name, humanBytes(int(total)))})
 }
 
-// handleIncomingFileReq shows a confirmation prompt, waits for the user's decision,
-// then either receives the file or tells the sender it was declined.
-// Called synchronously from the recv goroutine.
-func handleIncomingFileReq(req string, conn *transport.Conn, cipher *crypto.Cipher, prog *tea.Program, confirmCh chan bool, peerName string) {
-	parts := strings.SplitN(req, ":", 4)
+// handleIncomingFileOffer shows a confirmation prompt, waits for the user's decision,
+// then opens a dedicated UDP connection and receives the file using the sliding-window protocol.
+// Called in a goroutine so the main recv loop stays live for chat messages.
+func handleIncomingFileOffer(offer string, chatConn *transport.Conn, cipher *crypto.Cipher, prog *tea.Program, confirmCh chan bool, peerName, peerChatIP string) {
+	// FILE_OFFER:<size>:<sender-ft-port>:<name>
+	// Name is last so filenames containing ':' parse correctly.
+	parts := strings.SplitN(offer, ":", 4)
 	if len(parts) != 4 {
 		return
 	}
-	name := parts[1]
-	size, err := strconv.Atoi(parts[2])
+	size, err := strconv.ParseInt(parts[1], 10, 64)
 	if err != nil {
 		return
 	}
-	expectedHash := parts[3]
+	senderFTPort, err := strconv.Atoi(parts[2])
+	if err != nil {
+		return
+	}
+	name := parts[3]
 
 	prog.Send(ui.ConfirmMsg{
-		Text: fmt.Sprintf("%s wants to send %s (%s)", peerName, name, humanBytes(size)),
+		Text: fmt.Sprintf("%s wants to send %s (%s)", peerName, name, humanBytes(int(size))),
 	})
 
 	// Block until the user responds (or times out).
@@ -251,79 +289,74 @@ func handleIncomingFileReq(req string, conn *transport.Conn, cipher *crypto.Ciph
 	select {
 	case accepted = <-confirmCh:
 	case <-time.After(60 * time.Second):
-		// Auto-decline on timeout.
-		enc, _ := cipher.Encrypt([]byte("FILE_ACK:no"))
-		conn.Send(enc) //nolint:errcheck
+		sendChatSignal(chatConn, cipher, "FILE_DECLINE")
 		prog.Send(ui.SystemMsg{Text: fmt.Sprintf("transfer from %s timed out — auto-declined", peerName)})
 		return
 	}
 
 	if !accepted {
-		// Send decline from within the recv goroutine so it's sequenced correctly.
-		enc, _ := cipher.Encrypt([]byte("FILE_ACK:no"))
-		conn.Send(enc) //nolint:errcheck
+		sendChatSignal(chatConn, cipher, "FILE_DECLINE")
 		prog.Send(ui.SystemMsg{Text: fmt.Sprintf("declined %s from %s", name, peerName)})
 		return
 	}
 
-	// Send acceptance and immediately start the receive loop — no gap between
-	// the sender getting the ACK and us being ready to receive chunks.
-	enc, err := cipher.Encrypt([]byte("FILE_ACK:yes"))
+	// Bind a dedicated FT socket and discover our public FT port.
+	ftConn, err := punch.BindSocket()
 	if err != nil {
-		prog.Send(ui.SystemMsg{Text: "confirm error: " + err.Error()})
+		prog.Send(ui.SystemMsg{Text: "FT accept error (bind): " + err.Error()})
+		sendChatSignal(chatConn, cipher, "FILE_DECLINE")
 		return
 	}
-	if err := conn.Send(enc); err != nil {
-		prog.Send(ui.SystemMsg{Text: "confirm error: " + err.Error()})
+	defer ftConn.Close()
+
+	_, myFTPort, err := stun.Discover(ftConn)
+	if err != nil {
+		prog.Send(ui.SystemMsg{Text: "FT accept error (STUN): " + err.Error()})
+		sendChatSignal(chatConn, cipher, "FILE_DECLINE")
 		return
 	}
 
-	// Receive the file.
-	prog.Send(ui.SystemMsg{Text: fmt.Sprintf("receiving %s (%s)...", name, humanBytes(size))})
+	// Tell sender our FT port so both sides can punch simultaneously.
+	sendChatSignal(chatConn, cipher, fmt.Sprintf("FILE_ACCEPT:%d", myFTPort))
 
-	var fileData []byte
+	senderFTAddr := &net.UDPAddr{IP: net.ParseIP(peerChatIP), Port: senderFTPort}
 
-	for {
-		raw, err := conn.Recv()
-		if err != nil {
-			prog.Send(ui.ProgressMsg{})
-			prog.Send(ui.SystemMsg{Text: "receive error: " + err.Error()})
-			return
-		}
-		plain, err := cipher.Decrypt(raw)
-		if err != nil {
-			prog.Send(ui.ProgressMsg{})
-			prog.Send(ui.SystemMsg{Text: "decrypt error: " + err.Error()})
-			return
-		}
-		if string(plain) == "EOF" {
-			break
-		}
-		fileData = append(fileData, plain...)
-		if size > 0 {
-			pct := len(fileData) * 100 / size
-			prog.Send(ui.ProgressMsg{Text: fmt.Sprintf("%s  %s  %d%%", progressBar(pct), name, pct)})
-		}
+	// Punch the dedicated connection.
+	prog.Send(ui.ProgressMsg{Text: fmt.Sprintf("opening FT channel to %s...", peerName)})
+	if err := punch.SoloPunch(ftConn, senderFTAddr); err != nil {
+		prog.Send(ui.ProgressMsg{})
+		prog.Send(ui.SystemMsg{Text: "FT punch failed: " + err.Error()})
+		return
 	}
 
+	prog.Send(ui.SystemMsg{Text: fmt.Sprintf("receiving %s (%s)...", name, humanBytes(int(size)))})
+
+	// Determine save path (cwd/name).
+	savePath := name
+	absPath, _ := filepath.Abs(savePath)
+
+	err = filetransfer.Receive(ftConn, senderFTAddr, savePath, size, cipher, func(recv, tot int64) {
+		if tot == 0 {
+			return
+		}
+		pct := int(recv * 100 / tot)
+		prog.Send(ui.ProgressMsg{Text: fmt.Sprintf("%s  %s  %d%%", progressBar(pct), name, pct)})
+	})
 	prog.Send(ui.ProgressMsg{})
-
-	got := sha256.Sum256(fileData)
-	if hex.EncodeToString(got[:]) != expectedHash {
-		prog.Send(ui.SystemMsg{Text: fmt.Sprintf("hash mismatch for %s — file may be corrupted", name)})
-		return
-	}
-
-	if err := os.WriteFile(name, fileData, 0644); err != nil {
-		prog.Send(ui.SystemMsg{Text: "save error: " + err.Error()})
-		return
-	}
-
-	absPath, err := filepath.Abs(name)
 	if err != nil {
-		absPath = name
+		prog.Send(ui.SystemMsg{Text: fmt.Sprintf("receive error (%s): %s", name, err.Error())})
+		return
 	}
 	prog.Send(ui.SystemMsg{Text: fmt.Sprintf("saved %s → %s", name, absPath)})
+}
+
+// sendChatSignal encrypts and sends a control string over the chat connection.
+func sendChatSignal(conn *transport.Conn, cipher *crypto.Cipher, msg string) {
+	enc, err := cipher.Encrypt([]byte(msg))
+	if err != nil {
+		return
+	}
+	conn.Send(enc) //nolint:errcheck
 }
 
 // exchangeNames performs a best-effort name handshake immediately after connecting.

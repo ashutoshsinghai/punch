@@ -143,6 +143,55 @@ func dialOne(remoteIP string, remotePort uint16) (*Result, error) {
 	return nil, fmt.Errorf("no response from %s:%d within %s", remoteIP, remotePort, probeTimeout)
 }
 
+// SoloPunch performs simultaneous hole punching on conn to reach remote.
+// Unlike Simultaneous, it does NOT wrap the connection in transport.Conn —
+// the caller gets the raw *net.UDPConn back for use with a custom protocol
+// (e.g. the sliding-window file transfer).
+//
+// Both sides must call SoloPunch at roughly the same time. The function
+// returns once a probe is received from remote, indicating the hole is open.
+func SoloPunch(conn *net.UDPConn, remote *net.UDPAddr) error {
+	const timeout = 2 * time.Minute
+
+	deadline := time.Now().Add(timeout)
+	ticker := time.NewTicker(probeInterval)
+	defer ticker.Stop()
+
+	probe := []byte(probeMsg)
+	buf := make([]byte, 512)
+
+	for time.Now().Before(deadline) {
+		select {
+		case <-ticker.C:
+			conn.WriteToUDP(probe, remote) //nolint:errcheck
+		default:
+		}
+
+		conn.SetReadDeadline(time.Now().Add(probeInterval))
+		n, from, err := conn.ReadFromUDP(buf)
+		if err != nil {
+			continue
+		}
+
+		if from.String() == remote.String() &&
+			n >= len(probeMsg) && string(buf[:len(probeMsg)]) == probeMsg {
+			conn.SetReadDeadline(time.Time{})
+			// Keep probing briefly so the peer can also exit their loop.
+			go func() {
+				for i := 0; i < 10; i++ {
+					conn.WriteToUDP(probe, remote) //nolint:errcheck
+					time.Sleep(probeInterval)
+				}
+			}()
+			return nil
+		}
+	}
+
+	return fmt.Errorf(
+		"file-transfer hole punch failed — symmetric NAT or peer unreachable (tried for %s)", timeout,
+	)
+}
+
 // RandomPort picks a random available UDP port in the high range.
 func RandomPort() (uint16, error) {
 	addr := &net.UDPAddr{Port: 0}

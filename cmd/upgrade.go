@@ -183,6 +183,7 @@ func applyRelease(release githubRelease) {
 	tmpBinary := currentBinary + ".new"
 	if err := copyFile(newBinaryPath, tmpBinary); err != nil {
 		fmt.Printf("Could not write new binary: %v\n", err)
+		fmt.Printf("Hint: try  sudo punch upgrade\n")
 		os.Exit(1)
 	}
 	os.Chmod(tmpBinary, 0755)

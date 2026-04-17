@@ -35,9 +35,9 @@ const (
 	typeFin  = 0x05
 
 	maxPacketSize = 65507 // max safe UDP payload
-	ackTimeout    = 500 * time.Millisecond
-	maxRetries    = 10
-	readDeadline  = 30 * time.Second
+	ackTimeout    = 2 * time.Second
+	maxRetries    = 30
+	readDeadline  = 60 * time.Second
 )
 
 // Conn is a reliable UDP connection to a single remote peer.
