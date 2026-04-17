@@ -245,12 +245,22 @@ func chatSendFile(path string, chatConn *transport.Conn, cipher *crypto.Cipher, 
 	prog.Send(ui.ProgressMsg{Text: fmt.Sprintf("sending %s (%s)...", name, humanBytes(int(total)))})
 
 	ftStart := time.Now()
+	var speedLastBytes int64
+	speedLastTime := ftStart
+	var speedStr string
 	err = filetransfer.Send(ftConn, peerFTAddr, path, cipher, func(sent, tot int64) {
 		if tot == 0 {
 			return
 		}
+		now := time.Now()
+		if now.Sub(speedLastTime) >= 250*time.Millisecond {
+			speed := float64(sent-speedLastBytes) / now.Sub(speedLastTime).Seconds()
+			speedStr = humanBytes(int(speed)) + "/s"
+			speedLastBytes = sent
+			speedLastTime = now
+		}
 		pct := int(sent * 100 / tot)
-		prog.Send(ui.ProgressMsg{Text: fmt.Sprintf("%s  %s  %d%%", progressBar(pct), name, pct)})
+		prog.Send(ui.ProgressMsg{Text: fmt.Sprintf("%s  %s  %d%%  %s", progressBar(pct), name, pct, speedStr)})
 	})
 	elapsed := time.Since(ftStart)
 	prog.Send(ui.ProgressMsg{})
@@ -339,12 +349,22 @@ func handleIncomingFileOffer(offer string, chatConn *transport.Conn, cipher *cry
 	absPath, _ := filepath.Abs(savePath)
 
 	ftStart := time.Now()
+	var speedLastBytes int64
+	speedLastTime := ftStart
+	var speedStr string
 	err = filetransfer.Receive(ftConn, senderFTAddr, savePath, size, cipher, func(recv, tot int64) {
 		if tot == 0 {
 			return
 		}
+		now := time.Now()
+		if now.Sub(speedLastTime) >= 250*time.Millisecond {
+			speed := float64(recv-speedLastBytes) / now.Sub(speedLastTime).Seconds()
+			speedStr = humanBytes(int(speed)) + "/s"
+			speedLastBytes = recv
+			speedLastTime = now
+		}
 		pct := int(recv * 100 / tot)
-		prog.Send(ui.ProgressMsg{Text: fmt.Sprintf("%s  %s  %d%%", progressBar(pct), name, pct)})
+		prog.Send(ui.ProgressMsg{Text: fmt.Sprintf("%s  %s  %d%%  %s", progressBar(pct), name, pct, speedStr)})
 	})
 	elapsed := time.Since(ftStart)
 	prog.Send(ui.ProgressMsg{})

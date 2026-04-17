@@ -27,7 +27,6 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"syscall"
 	"time"
 
 	"github.com/ashutoshsinghai/punch/internal/transport"
@@ -213,17 +212,6 @@ func BindSocket() (*net.UDPConn, error) {
 		return nil, fmt.Errorf("failed to bind UDP socket: %w", err)
 	}
 	return conn, nil
-}
-
-// enableBroadcast sets SO_BROADCAST on conn so we can send to 255.255.255.255.
-func enableBroadcast(conn *net.UDPConn) {
-	rc, err := conn.SyscallConn()
-	if err != nil {
-		return
-	}
-	rc.Control(func(fd uintptr) { //nolint:errcheck
-		syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_BROADCAST, 1) //nolint:errcheck
-	})
 }
 
 // isPrivateIP returns true for RFC-1918 / link-local addresses (LAN peers).
