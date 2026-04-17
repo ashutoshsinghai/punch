@@ -48,6 +48,7 @@ func runShare(_ *cobra.Command, _ []string) error {
 	if err != nil {
 		return fmt.Errorf("STUN discovery failed: %w", err)
 	}
+	fmt.Fprintf(os.Stderr, "Your public address: %s:%d\n", publicIP, publicPort)
 
 	payload, err := token.NewPayload(publicIP, publicPort, expiry)
 	if err != nil {

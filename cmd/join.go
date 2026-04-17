@@ -41,6 +41,8 @@ func runJoin(_ *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("STUN discovery failed: %w", err)
 	}
+	fmt.Fprintf(os.Stderr, "Your public address: %s:%d\n", myPublicIP, myPublicPort)
+	fmt.Fprintf(os.Stderr, "Peer's public address: %s:%d\n", payload.IP, payload.Port)
 
 	replyPayload, err := token.NewReplyPayload(myPublicIP, myPublicPort, payload.Session)
 	if err != nil {
