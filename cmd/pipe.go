@@ -46,8 +46,7 @@ func pipeReceive() error {
 	if err != nil {
 		return err
 	}
-	localIP, _ := ip.Local()
-	payload, err := token.NewPayload(publicIP, localIP, port, token.DefaultExpiry)
+	payload, err := token.NewPayload(publicIP, port, token.DefaultExpiry)
 	if err != nil {
 		return err
 	}
@@ -99,7 +98,7 @@ func pipeSend(rawToken string) error {
 
 	fmt.Fprintf(os.Stderr, "Connecting to %s:%d...\n", payload.IP, payload.Port)
 
-	result, err := punch.Dial(payload.IP, payload.LocalIP, payload.Port)
+	result, err := punch.Dial(payload.IP, payload.Port)
 	if err != nil {
 		return err
 	}

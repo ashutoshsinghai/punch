@@ -44,8 +44,7 @@ func runReceive(_ *cobra.Command, args []string) error {
 		if err != nil {
 			return err
 		}
-		localIP, _ := ip.Local()
-		payload, err := token.NewPayload(publicIP, localIP, port, token.DefaultExpiry)
+		payload, err := token.NewPayload(publicIP, port, token.DefaultExpiry)
 		if err != nil {
 			return err
 		}
@@ -70,7 +69,7 @@ func runReceive(_ *cobra.Command, args []string) error {
 			return fmt.Errorf("invalid token: %w", err)
 		}
 		fmt.Fprintf(os.Stderr, "Connecting to %s port %d...\n", payload.IP, payload.Port)
-		result, err = punch.Dial(payload.IP, payload.LocalIP, payload.Port)
+		result, err = punch.Dial(payload.IP, payload.Port)
 		if err != nil {
 			return err
 		}

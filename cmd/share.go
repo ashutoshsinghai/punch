@@ -1,12 +1,15 @@
 package cmd
 
 import (
+	"bufio"
 	"fmt"
+	"net"
 	"os"
+	"strings"
 	"time"
 
-	"github.com/ashutoshsinghai/punch/internal/ip"
 	"github.com/ashutoshsinghai/punch/internal/punch"
+	"github.com/ashutoshsinghai/punch/internal/stun"
 	"github.com/ashutoshsinghai/punch/internal/token"
 	"github.com/spf13/cobra"
 )
@@ -34,19 +37,19 @@ func runShare(_ *cobra.Command, _ []string) error {
 		return fmt.Errorf("invalid expiry %q: %w", shareExpire, err)
 	}
 
-	fmt.Fprintln(os.Stderr, "Discovering IPs...")
-	publicIP, err := ip.Public()
-	if err != nil {
-		return fmt.Errorf("could not get public IP: %w", err)
-	}
-	localIP, _ := ip.Local()
+	fmt.Fprintln(os.Stderr, "Discovering your public address via STUN...")
 
-	port, err := punch.RandomPort()
+	conn, err := punch.BindSocket()
 	if err != nil {
-		return fmt.Errorf("could not allocate port: %w", err)
+		return err
 	}
 
-	payload, err := token.NewPayload(publicIP, localIP, port, expiry)
+	publicIP, publicPort, err := stun.Discover(conn)
+	if err != nil {
+		return fmt.Errorf("STUN discovery failed: %w", err)
+	}
+
+	payload, err := token.NewPayload(publicIP, publicPort, expiry)
 	if err != nil {
 		return fmt.Errorf("could not create token: %w", err)
 	}
@@ -62,14 +65,37 @@ func runShare(_ *cobra.Command, _ []string) error {
 	}
 
 	fmt.Printf("\nToken: %s\n", display)
-	fmt.Printf("Send this to your peer. Expires in %s.\n\n", expiry)
-	fmt.Fprintln(os.Stderr, "Waiting for connection...")
+	fmt.Printf("Send this to your peer over WhatsApp/Signal. Expires in %s.\n\n", expiry)
+	fmt.Print("Peer's reply token: ")
 
-	result, err := punch.Listen(port)
+	reader := bufio.NewReader(os.Stdin)
+	replyTok, err := reader.ReadString('\n')
+	if err != nil {
+		return fmt.Errorf("failed to read reply token: %w", err)
+	}
+	replyTok = strings.TrimSpace(replyTok)
+
+	replyPayload, err := token.Decode(replyTok)
+	if err != nil {
+		return fmt.Errorf("invalid reply token: %w", err)
+	}
+
+	if replyPayload.Session != payload.Session {
+		return fmt.Errorf("session mismatch — make sure your peer used your token")
+	}
+
+	remote := &net.UDPAddr{
+		IP:   net.ParseIP(replyPayload.IP),
+		Port: int(replyPayload.Port),
+	}
+
+	fmt.Fprintln(os.Stderr, "\nPunching through NAT...")
+
+	result, err := punch.Simultaneous(conn, remote)
 	if err != nil {
 		return err
 	}
 
-	fmt.Fprintf(os.Stderr, "Connected to %s. Direct P2P. No server.\n\n", result.Remote)
+	fmt.Fprintln(os.Stderr, "Connected. Direct P2P. No server.\n")
 	return runChat(result, payload.SessionHex())
 }

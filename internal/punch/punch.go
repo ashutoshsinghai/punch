@@ -82,46 +82,16 @@ func Listen(localPort uint16) (*Result, error) {
 // Dial punches through to a peer. It tries the local (LAN) IP first to avoid
 // hairpin NAT issues when both peers are on the same network, then falls back
 // to the public IP for cross-network connections.
-func Dial(publicIP, localIP string, remotePort uint16) (*Result, error) {
-	candidates := dedupIPs(localIP, publicIP)
-	if len(candidates) == 0 {
-		return nil, fmt.Errorf("no remote addresses to try")
+func Dial(remoteIP string, remotePort uint16) (*Result, error) {
+	fmt.Fprintf(os.Stderr, "Connecting to %s:%d...\n", remoteIP, remotePort)
+	result, err := dialOne(remoteIP, remotePort)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"direct connection failed — symmetric NAT detected or peer unreachable.\n"+
+				"(error: %w)", err,
+		)
 	}
-
-	type dialResult struct {
-		result *Result
-		err    error
-		label  string
-	}
-
-	ch := make(chan dialResult, len(candidates))
-
-	for i, ipStr := range candidates {
-		label := "public"
-		if i == 0 && localIP != "" && localIP != publicIP {
-			label = "local"
-		}
-		fmt.Fprintf(os.Stderr, "Trying %s address (%s)...\n", label, ipStr)
-		go func(ip, lbl string) {
-			r, err := dialOne(ip, remotePort)
-			ch <- dialResult{result: r, err: err, label: lbl}
-		}(ipStr, label)
-	}
-
-	var lastErr error
-	for range candidates {
-		dr := <-ch
-		if dr.err == nil {
-			return dr.result, nil
-		}
-		lastErr = dr.err
-	}
-
-	return nil, fmt.Errorf(
-		"direct connection failed — symmetric NAT detected or peer unreachable.\n"+
-			"Ask your peer to run `punch share` from their side, or try from a different network.\n"+
-			"(last error: %w)", lastErr,
-	)
+	return result, nil
 }
 
 // dialOne attempts hole punching to a single IP:port.
@@ -173,19 +143,6 @@ func dialOne(remoteIP string, remotePort uint16) (*Result, error) {
 	return nil, fmt.Errorf("no response from %s:%d within %s", remoteIP, remotePort, probeTimeout)
 }
 
-// dedupIPs returns a list of IPs to try, local first, deduplicating equal entries.
-func dedupIPs(localIP, publicIP string) []string {
-	seen := map[string]bool{}
-	var out []string
-	for _, ip := range []string{localIP, publicIP} {
-		if ip != "" && !seen[ip] {
-			seen[ip] = true
-			out = append(out, ip)
-		}
-	}
-	return out
-}
-
 // RandomPort picks a random available UDP port in the high range.
 func RandomPort() (uint16, error) {
 	addr := &net.UDPAddr{Port: 0}
@@ -196,4 +153,62 @@ func RandomPort() (uint16, error) {
 	port := conn.LocalAddr().(*net.UDPAddr).Port
 	conn.Close()
 	return uint16(port), nil
+}
+
+// BindSocket creates a new UDP socket on a random available port and
+// returns it ready for use (STUN discovery, hole punching, etc.).
+func BindSocket() (*net.UDPConn, error) {
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{Port: 0})
+	if err != nil {
+		return nil, fmt.Errorf("failed to bind UDP socket: %w", err)
+	}
+	return conn, nil
+}
+
+// Simultaneous performs true simultaneous UDP hole punching.
+// Both peers must know each other's public IP:port in advance (via token
+// exchange) and call Simultaneous at roughly the same time.
+//
+// Bob should call this immediately after printing his reply token so that
+// his probes keep the NAT hole open while Alice reads the token.
+// Alice calls it after entering Bob's reply token.
+// Once both sides are probing each other the holes open and they connect.
+func Simultaneous(conn *net.UDPConn, remote *net.UDPAddr) (*Result, error) {
+	const timeout = 10 * time.Minute
+
+	deadline := time.Now().Add(timeout)
+	ticker := time.NewTicker(probeInterval)
+	defer ticker.Stop()
+
+	probe := []byte(probeMsg)
+	buf := make([]byte, 512)
+
+	for time.Now().Before(deadline) {
+		select {
+		case <-ticker.C:
+			conn.WriteToUDP(probe, remote) //nolint:errcheck
+		default:
+		}
+
+		conn.SetReadDeadline(time.Now().Add(probeInterval))
+		n, from, err := conn.ReadFromUDP(buf)
+		if err != nil {
+			continue
+		}
+
+		if from.String() == remote.String() &&
+			n >= len(probeMsg) && string(buf[:len(probeMsg)]) == probeMsg {
+			conn.SetReadDeadline(time.Time{})
+			local := conn.LocalAddr().(*net.UDPAddr)
+			tc := transport.Wrap(conn, remote)
+			return &Result{Conn: tc, Local: local, Remote: remote}, nil
+		}
+	}
+
+	conn.Close()
+	return nil, fmt.Errorf(
+		"direct connection failed — symmetric NAT detected or peer unreachable.\n" +
+			"Ask your peer to try from a different network.\n" +
+			"(tried for %s)", timeout,
+	)
 }

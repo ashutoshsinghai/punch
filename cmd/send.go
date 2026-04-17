@@ -47,7 +47,7 @@ func runSend(_ *cobra.Command, args []string) error {
 
 	fmt.Fprintf(os.Stderr, "Connecting to %s port %d...\n", payload.IP, payload.Port)
 
-	result, err := punch.Dial(payload.IP, payload.LocalIP, payload.Port)
+	result, err := punch.Dial(payload.IP, payload.Port)
 	if err != nil {
 		return err
 	}
