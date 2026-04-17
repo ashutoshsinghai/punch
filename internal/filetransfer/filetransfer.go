@@ -1,14 +1,14 @@
-// Package filetransfer implements a sliding-window (Go-Back-N) file transfer
+// Package filetransfer implements a Selective Repeat ARQ file transfer
 // protocol over a raw UDP connection.
 //
-// Each chunk is encrypted independently using the provided Cipher before
-// being written to the wire. The receiver verifies a SHA-256 hash of the
-// complete file once it receives the EOF sentinel.
+// Unlike Go-Back-N, only the specific lost chunk is retransmitted —
+// out-of-order chunks are buffered on the receiver side. This gives
+// significantly better throughput on lossy or high-latency paths.
 //
 // Wire packet layout:
 //
 //	DATA:  [0x01][4-byte seq BE][encrypted chunk]
-//	ACK:   [0x02][4-byte ack BE]          — cumulative: "received all ≤ ack"
+//	ACK:   [0x02][4-byte seq BE]  — individual ACK per chunk
 //	EOF:   [0x03][4-byte zero][encrypted 32-byte SHA-256 hash]
 //	ABORT: [0x04][4-byte zero]
 package filetransfer
@@ -33,38 +33,37 @@ const (
 	typeAbort byte = 0x04
 
 	// ChunkSize is the plaintext payload per DATA packet.
-	// Must fit inside a single UDP datagram after headers + encryption overhead:
-	//   Ethernet MTU 1500 - IP(20) - UDP(8) - pkt header(5) - ChaCha20 overhead(28) = 1439
-	// Use 1400 to leave headroom for PPPoE, VPN tunnels, etc.
+	// Must fit in one UDP datagram:
+	//   Ethernet MTU 1500 - IP(20) - UDP(8) - pkt header(5) - ChaCha20(28) = 1439
+	// Use 1400 for headroom (PPPoE, VPN tunnels, etc.).
 	ChunkSize = 1400
 
-	// WindowSize is the number of unacknowledged chunks in flight.
-	// Throughput ≈ WindowSize × ChunkSize / RTT.
-	// 64 × 1400 B = 87 KB in flight; large enough for good throughput
-	// without blowing the NAT's packet buffer.
+	// WindowSize is the max number of unacknowledged chunks in flight.
 	WindowSize = 64
 
-	ackTimeout       = 3 * time.Second  // retransmit window after no ACK
-	transferDeadline = 90 * time.Second // max silence before giving up
+	// retransmitTimeout is how long to wait for an individual ACK before
+	// resending that specific chunk. Shorter = faster recovery from loss.
+	retransmitTimeout = 400 * time.Millisecond
 
-	// pacingDelay is the minimum gap between consecutive DATA packets.
-	// Without pacing the sender bursts the entire window in microseconds,
-	// overflowing NAT buffers and causing near-100% loss → Go-Back-N
-	// retransmits everything → stuck at 0%.
-	// 1 ms pacing → ceiling of 1400 B / 1 ms ≈ 1.4 MB/s, well within
-	// most NAT/router buffer limits.
-	pacingDelay = time.Millisecond
+	// pacingDelay is the gap between consecutive DATA sends.
+	// 500 µs → ceiling ≈ 1400 B / 500 µs = 2.8 MB/s; keeps NAT buffers happy.
+	pacingDelay = 500 * time.Microsecond
+
+	transferDeadline = 90 * time.Second
 )
 
-// headerSize is the fixed 5-byte header (type + seq).
-const headerSize = 5
+const headerSize = 5 // type(1) + seq(4)
 
-// maxPacket is the largest packet we ever read: header + encrypted chunk.
-// ChaCha20-Poly1305 overhead is 12 (nonce) + 16 (tag) = 28 bytes.
-const maxPacket = headerSize + ChunkSize + 28
+const maxPacket = headerSize + ChunkSize + 28 // +28 for ChaCha20 overhead
 
-// Send streams the file at filePath to remote using a sliding window protocol.
-// progress(sent, total) is called after each ACKed window advance; may be nil.
+// slot tracks a single in-flight chunk on the sender side.
+type slot struct {
+	enc    []byte    // cached encrypted payload (reused on retransmit)
+	acked  bool
+	sentAt time.Time
+}
+
+// Send streams the file at filePath to remote using Selective Repeat ARQ.
 func Send(conn *net.UDPConn, remote *net.UDPAddr, filePath string, cipher *crypto.Cipher, progress func(int64, int64)) error {
 	f, err := os.Open(filePath)
 	if err != nil {
@@ -72,31 +71,30 @@ func Send(conn *net.UDPConn, remote *net.UDPAddr, filePath string, cipher *crypt
 	}
 	defer f.Close()
 
-	// First pass: compute SHA-256 hash and total size.
+	// First pass: compute SHA-256 and total size.
 	hasher := sha256.New()
 	totalSize, err := io.Copy(hasher, f)
 	if err != nil {
-		return fmt.Errorf("hashing %s: %w", filePath, err)
+		return fmt.Errorf("hash %s: %w", filePath, err)
 	}
 	fileHash := hasher.Sum(nil)
-
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
 		return fmt.Errorf("seek: %w", err)
 	}
 
-	totalChunks := uint32((totalSize + ChunkSize - 1) / ChunkSize)
-	if totalSize == 0 {
-		totalChunks = 0
+	totalChunks := uint32(0)
+	if totalSize > 0 {
+		totalChunks = uint32((totalSize + ChunkSize - 1) / ChunkSize)
 	}
 
-	// Goroutine to drain incoming ACKs into a channel.
+	// Goroutine: drain ACKs into a channel.
 	ackCh := make(chan uint32, WindowSize*4)
-	stopACKReader := make(chan struct{})
+	stopACK := make(chan struct{})
 	go func() {
-		buf := make([]byte, 64)
+		buf := make([]byte, 9)
 		for {
 			select {
-			case <-stopACKReader:
+			case <-stopACK:
 				return
 			default:
 			}
@@ -105,10 +103,7 @@ func Send(conn *net.UDPConn, remote *net.UDPAddr, filePath string, cipher *crypt
 			if err != nil {
 				continue
 			}
-			if addr.String() != remote.String() {
-				continue
-			}
-			if n < headerSize || buf[0] != typeACK {
+			if addr.String() != remote.String() || n < headerSize || buf[0] != typeACK {
 				continue
 			}
 			seq := binary.BigEndian.Uint32(buf[1:5])
@@ -118,98 +113,126 @@ func Send(conn *net.UDPConn, remote *net.UDPAddr, filePath string, cipher *crypt
 			}
 		}
 	}()
-	defer close(stopACKReader)
+	defer close(stopACK)
 
-	// Sliding window: Go-Back-N.
+	inFlight := make(map[uint32]*slot, WindowSize)
 	windowBase := uint32(0)
 	nextSeq := uint32(0)
 	chunkBuf := make([]byte, ChunkSize)
 
-	sendChunk := func(seq uint32) error {
-		offset := int64(seq) * ChunkSize
-		n, err := f.ReadAt(chunkBuf, offset)
+	readEncChunk := func(seq uint32) ([]byte, error) {
+		n, err := f.ReadAt(chunkBuf, int64(seq)*ChunkSize)
 		if err != nil && err != io.EOF {
-			return fmt.Errorf("read chunk %d: %w", seq, err)
+			return nil, fmt.Errorf("read chunk %d: %w", seq, err)
 		}
 		enc, err := cipher.Encrypt(chunkBuf[:n])
 		if err != nil {
-			return fmt.Errorf("encrypt chunk %d: %w", seq, err)
+			return nil, fmt.Errorf("encrypt chunk %d: %w", seq, err)
 		}
-		pkt := makePacket(typeData, seq, enc)
-		_, err = conn.WriteToUDP(pkt, remote)
-		return err
+		return enc, nil
 	}
 
-	for windowBase < totalChunks {
-		// Fill the window, pacing each chunk to avoid bursting the NAT buffer.
-		for nextSeq < windowBase+WindowSize && nextSeq < totalChunks {
-			if err := sendChunk(nextSeq); err != nil {
-				return err
+	sendChunk := func(seq uint32, enc []byte) {
+		conn.WriteToUDP(makePacket(typeData, seq, enc), remote) //nolint:errcheck
+	}
+
+	advanceWindow := func() {
+		for {
+			s, ok := inFlight[windowBase]
+			if !ok || !s.acked {
+				break
 			}
-			nextSeq++
-			time.Sleep(pacingDelay)
+			delete(inFlight, windowBase)
+			windowBase++
 		}
+	}
 
-		// Wait for an ACK or a retransmit timeout.
-		timer := time.NewTimer(ackTimeout)
-		gotACK := false
-
-	drainACKs:
+	drainACKs := func() {
 		for {
 			select {
 			case ack := <-ackCh:
-				timer.Stop()
-				if ack+1 > windowBase {
-					windowBase = ack + 1
-					if progress != nil {
-						sent := int64(windowBase) * ChunkSize
-						if sent > totalSize {
-							sent = totalSize
-						}
-						progress(sent, totalSize)
-					}
+				if s, ok := inFlight[ack]; ok {
+					s.acked = true
 				}
-				gotACK = true
-				// Drain any additional queued ACKs before re-filling window.
-			drainMore:
-				for {
-					select {
-					case more := <-ackCh:
-						if more+1 > windowBase {
-							windowBase = more + 1
-							if progress != nil {
-								sent := int64(windowBase) * ChunkSize
-								if sent > totalSize {
-									sent = totalSize
-								}
-								progress(sent, totalSize)
-							}
-						}
-					default:
-						break drainMore
-					}
-				}
-				break drainACKs
-
-			case <-timer.C:
-				if !gotACK {
-					// Go-Back-N: retransmit the whole window.
-					nextSeq = windowBase
-				}
-				break drainACKs
+			default:
+				return
 			}
 		}
 	}
 
-	// Send EOF with encrypted hash. Retry several times to survive packet loss.
+	retransmitTicker := time.NewTicker(100 * time.Millisecond)
+	defer retransmitTicker.Stop()
+
+	for windowBase < totalChunks {
+		// Process any queued ACKs and slide the window.
+		drainACKs()
+		advanceWindow()
+
+		// Report progress.
+		if progress != nil {
+			sent := int64(windowBase) * ChunkSize
+			if sent > totalSize {
+				sent = totalSize
+			}
+			progress(sent, totalSize)
+		}
+
+		// Retransmit any chunks that timed out (Selective Repeat: only lost ones).
+		select {
+		case <-retransmitTicker.C:
+			now := time.Now()
+			for seq, s := range inFlight {
+				if !s.acked && now.Sub(s.sentAt) > retransmitTimeout {
+					sendChunk(seq, s.enc)
+					s.sentAt = now
+				}
+			}
+		default:
+		}
+
+		// Fill window with new chunks (paced).
+		for nextSeq < windowBase+WindowSize && nextSeq < totalChunks {
+			if _, exists := inFlight[nextSeq]; !exists {
+				enc, err := readEncChunk(nextSeq)
+				if err != nil {
+					return err
+				}
+				sendChunk(nextSeq, enc)
+				inFlight[nextSeq] = &slot{enc: enc, sentAt: time.Now()}
+				time.Sleep(pacingDelay)
+			}
+			nextSeq++
+		}
+
+		// If window is full, block until an ACK arrives or retransmit fires.
+		if uint32(len(inFlight)) >= WindowSize {
+			select {
+			case ack := <-ackCh:
+				if s, ok := inFlight[ack]; ok {
+					s.acked = true
+				}
+				advanceWindow()
+			case <-retransmitTicker.C:
+				now := time.Now()
+				for seq, s := range inFlight {
+					if !s.acked && now.Sub(s.sentAt) > retransmitTimeout {
+						sendChunk(seq, s.enc)
+						s.sentAt = now
+					}
+				}
+			}
+		}
+	}
+
+	// Send EOF with encrypted hash; retry to survive loss.
 	hashEnc, err := cipher.Encrypt(fileHash)
 	if err != nil {
 		return fmt.Errorf("encrypt hash: %w", err)
 	}
 	eofPkt := makePacket(typeEOF, 0, hashEnc)
-	for i := 0; i < 15; i++ {
+	for i := 0; i < 20; i++ {
 		conn.WriteToUDP(eofPkt, remote) //nolint:errcheck
-		time.Sleep(200 * time.Millisecond)
+		time.Sleep(100 * time.Millisecond)
 	}
 
 	if progress != nil {
@@ -218,9 +241,8 @@ func Send(conn *net.UDPConn, remote *net.UDPAddr, filePath string, cipher *crypt
 	return nil
 }
 
-// Receive reads chunks from remote, writes them to savePath, and verifies
-// the SHA-256 hash sent in the EOF packet.
-// progress(received, total) is called after each in-order chunk; may be nil.
+// Receive reads chunks from remote, buffers out-of-order ones, writes them
+// in order to savePath, and verifies the SHA-256 hash in the EOF packet.
 func Receive(conn *net.UDPConn, remote *net.UDPAddr, savePath string, totalSize int64, cipher *crypto.Cipher, progress func(int64, int64)) error {
 	partPath := savePath + ".part"
 	f, err := os.Create(partPath)
@@ -237,11 +259,28 @@ func Receive(conn *net.UDPConn, remote *net.UDPAddr, savePath string, totalSize 
 
 	expected := uint32(0)
 	received := int64(0)
+	outOfOrder := make(map[uint32][]byte) // seq → plaintext
 	buf := make([]byte, maxPacket)
 
 	sendACK := func(seq uint32) {
-		pkt := makePacket(typeACK, seq, nil)
-		conn.WriteToUDP(pkt, remote) //nolint:errcheck
+		conn.WriteToUDP(makePacket(typeACK, seq, nil), remote) //nolint:errcheck
+	}
+
+	// Drain outOfOrder buffer: write consecutive chunks starting at expected.
+	drainBuffer := func() error {
+		for {
+			plain, ok := outOfOrder[expected]
+			if !ok {
+				break
+			}
+			if _, err := f.Write(plain); err != nil {
+				return fmt.Errorf("write chunk %d: %w", expected, err)
+			}
+			received += int64(len(plain))
+			delete(outOfOrder, expected)
+			expected++
+		}
+		return nil
 	}
 
 	for {
@@ -250,10 +289,7 @@ func Receive(conn *net.UDPConn, remote *net.UDPAddr, savePath string, totalSize 
 		if err != nil {
 			return fmt.Errorf("receive timeout (no data for %s)", transferDeadline)
 		}
-		if addr.String() != remote.String() {
-			continue
-		}
-		if n < headerSize {
+		if addr.String() != remote.String() || n < headerSize {
 			continue
 		}
 
@@ -263,53 +299,57 @@ func Receive(conn *net.UDPConn, remote *net.UDPAddr, savePath string, totalSize 
 
 		switch pktType {
 		case typeData:
+			plain, err := cipher.Decrypt(payload)
+			if err != nil {
+				// Bad decrypt — likely a stray packet; ignore.
+				continue
+			}
+
+			// Always ACK so the sender knows this chunk arrived.
+			sendACK(seq)
+
+			if seq < expected {
+				// Duplicate — ACK already sent above, nothing else to do.
+				continue
+			}
 			if seq == expected {
-				plain, err := cipher.Decrypt(payload)
-				if err != nil {
-					// Decryption failure on an in-order chunk is fatal.
-					return fmt.Errorf("decrypt chunk %d: %w", seq, err)
-				}
 				if _, err := f.Write(plain); err != nil {
 					return fmt.Errorf("write chunk %d: %w", seq, err)
 				}
 				received += int64(len(plain))
-				sendACK(seq)
 				expected++
-				if progress != nil {
-					progress(received, totalSize)
+				if err := drainBuffer(); err != nil {
+					return err
 				}
-			} else if seq < expected {
-				// Duplicate — re-ACK so sender can slide its window.
-				sendACK(seq)
 			} else {
-				// Out-of-order (Go-Back-N): NAK by re-ACKing last in-order.
-				if expected > 0 {
-					sendACK(expected - 1)
+				// Out-of-order: buffer it (only if not already buffered).
+				if _, exists := outOfOrder[seq]; !exists {
+					cp := make([]byte, len(plain))
+					copy(cp, plain)
+					outOfOrder[seq] = cp
 				}
 			}
 
-		case typeEOF:
-			// Verify hash.
-			if len(payload) == 0 {
-				return fmt.Errorf("EOF packet missing hash")
+			if progress != nil {
+				progress(received, totalSize)
 			}
+
+		case typeEOF:
 			hashBytes, err := cipher.Decrypt(payload)
 			if err != nil {
 				return fmt.Errorf("decrypt EOF hash: %w", err)
 			}
-
 			f.Close()
 			closed = true
 
 			got, err := fileHash(partPath)
 			if err != nil {
-				return fmt.Errorf("hash verification: %w", err)
+				return fmt.Errorf("hash verify: %w", err)
 			}
 			if !bytes.Equal(got, hashBytes) {
 				os.Remove(partPath)
 				return fmt.Errorf("hash mismatch — file may be corrupted")
 			}
-
 			if err := os.Rename(partPath, savePath); err != nil {
 				return fmt.Errorf("rename %s → %s: %w", partPath, savePath, err)
 			}
@@ -321,13 +361,11 @@ func Receive(conn *net.UDPConn, remote *net.UDPAddr, savePath string, totalSize 
 	}
 }
 
-// Abort sends an ABORT packet to the peer to signal that we are cancelling.
+// Abort sends an ABORT packet to signal cancellation.
 func Abort(conn *net.UDPConn, remote *net.UDPAddr) {
-	pkt := makePacket(typeAbort, 0, nil)
-	conn.WriteToUDP(pkt, remote) //nolint:errcheck
+	conn.WriteToUDP(makePacket(typeAbort, 0, nil), remote) //nolint:errcheck
 }
 
-// makePacket builds a wire packet: [type(1)][seq(4)][payload].
 func makePacket(pktType byte, seq uint32, payload []byte) []byte {
 	buf := make([]byte, headerSize+len(payload))
 	buf[0] = pktType
@@ -336,7 +374,6 @@ func makePacket(pktType byte, seq uint32, payload []byte) []byte {
 	return buf
 }
 
-// fileHash computes the SHA-256 hash of the file at path.
 func fileHash(path string) ([]byte, error) {
 	f, err := os.Open(path)
 	if err != nil {
