@@ -65,7 +65,7 @@ func Wrap(conn *net.UDPConn, remote *net.UDPAddr) *Conn {
 		conn:    conn,
 		remote:  remote,
 		pending: make(map[uint32]chan struct{}),
-		recv:    make(chan []byte, 64),
+		recv:    make(chan []byte, 512),
 	}
 	go c.readLoop()
 	go c.keepaliveLoop()

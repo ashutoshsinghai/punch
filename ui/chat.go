@@ -19,10 +19,28 @@ type Message struct {
 // SendFn is called by the UI when the user submits a message.
 type SendFn func(msg string) error
 
+// knownCommands is the set of recognised slash-commands (prefix match for /send).
+var knownCommands = []string{"/quit", "/exit", "/ping", "/ip", "/info", "/geo", "/send "}
+
+func isKnownCommand(text string) bool {
+	for _, c := range knownCommands {
+		if strings.HasPrefix(c, "/send") {
+			// prefix match
+			if strings.HasPrefix(text, c) {
+				return true
+			}
+		} else if text == c {
+			return true
+		}
+	}
+	return false
+}
+
 // model is the Bubbletea model for the chat TUI.
 type model struct {
 	messages       []Message
-	input          string
+	inputRunes     []rune
+	cursor         int // rune index in inputRunes
 	myName         string
 	peerName       string
 	send           SendFn
@@ -45,8 +63,7 @@ type SystemMsg struct {
 	Text string
 }
 
-// ProgressMsg updates the live transfer progress bar.
-// Empty Text clears it.
+// ProgressMsg updates the live transfer progress bar. Empty Text clears it.
 type ProgressMsg struct {
 	Text string
 }
@@ -109,6 +126,32 @@ func (m model) Init() tea.Cmd {
 	return nil
 }
 
+func (m model) inputText() string { return string(m.inputRunes) }
+
+// insertRune inserts r at the current cursor position and advances the cursor.
+func (m *model) insertRune(r rune) {
+	m.inputRunes = append(m.inputRunes[:m.cursor],
+		append([]rune{r}, m.inputRunes[m.cursor:]...)...)
+	m.cursor++
+}
+
+// deleteBeforeCursor removes the rune immediately before the cursor.
+func (m *model) deleteBeforeCursor() {
+	if m.cursor == 0 {
+		return
+	}
+	m.inputRunes = append(m.inputRunes[:m.cursor-1], m.inputRunes[m.cursor:]...)
+	m.cursor--
+}
+
+// deleteAtCursor removes the rune at the cursor (forward delete).
+func (m *model) deleteAtCursor() {
+	if m.cursor >= len(m.inputRunes) {
+		return
+	}
+	m.inputRunes = append(m.inputRunes[:m.cursor], m.inputRunes[m.cursor+1:]...)
+}
+
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 
@@ -121,12 +164,37 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case tea.KeyCtrlC, tea.KeyEsc:
 			return m, tea.Quit
 
+		// --- cursor movement ---
+		case tea.KeyLeft:
+			if m.cursor > 0 {
+				m.cursor--
+			}
+		case tea.KeyRight:
+			if m.cursor < len(m.inputRunes) {
+				m.cursor++
+			}
+		case tea.KeyHome, tea.KeyCtrlA:
+			m.cursor = 0
+		case tea.KeyEnd, tea.KeyCtrlE:
+			m.cursor = len(m.inputRunes)
+
+		// --- editing ---
+		case tea.KeyBackspace, tea.KeyDelete:
+			if msg.Type == tea.KeyDelete {
+				m.deleteAtCursor()
+			} else {
+				m.deleteBeforeCursor()
+			}
+
+		case tea.KeySpace:
+			m.insertRune(' ')
+
 		case tea.KeyEnter:
-			text := strings.TrimSpace(m.input)
-			m.input = ""
+			text := strings.TrimSpace(m.inputText())
+			m.inputRunes = m.inputRunes[:0]
+			m.cursor = 0
 
 			if m.pendingConfirm {
-				// Any input: y/yes = accept, anything else = decline.
 				var reply string
 				if text == "y" || text == "yes" {
 					reply = "__CONFIRM__:yes"
@@ -149,8 +217,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Quit
 			}
 
-			// Commands handled by cmd layer — don't echo locally.
-			isCmd := text == "/ping" || text == "/ip" || strings.HasPrefix(text, "/send ")
+			// Unknown slash command — show error, don't send.
+			if strings.HasPrefix(text, "/") && !isKnownCommand(text) {
+				m.messages = append(m.messages, Message{
+					From: "",
+					Body: fmt.Sprintf("unknown command: %s", text),
+					At:   time.Now(),
+				})
+				return m, nil
+			}
+
+			// Known commands handled by cmd layer — don't echo locally.
+			isCmd := text == "/ping" || text == "/ip" || text == "/info" || text == "/geo" ||
+				strings.HasPrefix(text, "/send ")
 			if !isCmd {
 				m.messages = append(m.messages, Message{
 					From: m.myName,
@@ -167,17 +246,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return nil
 			}
 
-		case tea.KeySpace:
-			m.input += " "
-
-		case tea.KeyBackspace, tea.KeyDelete:
-			if len(m.input) > 0 {
-				m.input = m.input[:len(m.input)-1]
-			}
-
 		default:
 			if msg.Type == tea.KeyRunes {
-				m.input += string(msg.Runes)
+				for _, r := range msg.Runes {
+					m.insertRune(r)
+				}
 			}
 		}
 
@@ -215,7 +288,7 @@ func (m model) View() string {
 	}
 
 	headerLine := headerStyle.Render(
-		fmt.Sprintf("punch — %s ↔ %s   (/ping  /ip  /send <file>  /quit)", m.myName, m.peerName),
+		fmt.Sprintf("punch — %s ↔ %s   (/ping  /ip  /geo  /send <file>  /quit)", m.myName, m.peerName),
 	)
 
 	// Reserve lines for: header(1) + progress(0/1) + confirm(0/1) + input(3).
@@ -256,13 +329,18 @@ func (m model) View() string {
 
 	msgArea := strings.Join(lines, "\n")
 
+	// Render input with cursor block inserted at cursor position.
+	before := string(m.inputRunes[:m.cursor])
+	after := string(m.inputRunes[m.cursor:])
+	inputWithCursor := before + "█" + after
+
 	var promptLine string
 	if m.pendingConfirm {
 		promptLine = inputStyle.Width(m.width - 4).Render(
-			confirmStyle.Render("Accept? [y/N]: ") + m.input + "█",
+			confirmStyle.Render("Accept? [y/N]: ") + inputWithCursor,
 		)
 	} else {
-		promptLine = inputStyle.Width(m.width - 4).Render("> " + m.input + "█")
+		promptLine = inputStyle.Width(m.width - 4).Render("> " + inputWithCursor)
 	}
 
 	var errLine string

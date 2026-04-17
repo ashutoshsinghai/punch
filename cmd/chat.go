@@ -4,7 +4,10 @@ import (
 	"bufio"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -19,7 +22,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 )
 
-func runChat(result *punch.Result, session, myName string) error {
+func runChat(result *punch.Result, session, myName, myPublicAddr string) error {
 	cipher, err := crypto.NewCipher(session)
 	if err != nil {
 		return err
@@ -27,7 +30,7 @@ func runChat(result *punch.Result, session, myName string) error {
 
 	peerName := exchangeNames(result.Conn, cipher, myName)
 
-	localAddr := result.Local.String()
+	localAddr := myPublicAddr
 	remoteAddr := result.Remote.String()
 
 	// confirmCh receives the user's y/N decision for an incoming file request.
@@ -50,10 +53,15 @@ func runChat(result *punch.Result, session, myName string) error {
 			}()
 			return nil
 
-		case msg == "/ip":
+		case msg == "/ip", msg == "/info":
 			prog.Send(ui.SystemMsg{
 				Text: fmt.Sprintf("you: %s   peer: %s", localAddr, remoteAddr),
 			})
+			return nil
+
+		case msg == "/geo":
+			peerIP, _, _ := strings.Cut(remoteAddr, ":")
+			go lookupGeo(peerIP, peerName, prog)
 			return nil
 
 		case strings.HasPrefix(msg, "/send "):
@@ -62,24 +70,10 @@ func runChat(result *punch.Result, session, myName string) error {
 			return nil
 
 		case msg == "__CONFIRM__:yes":
-			enc, err := cipher.Encrypt([]byte("FILE_ACK:yes"))
-			if err != nil {
-				return err
-			}
-			if err := result.Conn.Send(enc); err != nil {
-				return err
-			}
 			confirmCh <- true
 			return nil
 
 		case msg == "__CONFIRM__:no":
-			enc, err := cipher.Encrypt([]byte("FILE_ACK:no"))
-			if err != nil {
-				return err
-			}
-			if err := result.Conn.Send(enc); err != nil {
-				return err
-			}
 			confirmCh <- false
 			return nil
 		}
@@ -265,7 +259,22 @@ func handleIncomingFileReq(req string, conn *transport.Conn, cipher *crypto.Ciph
 	}
 
 	if !accepted {
+		// Send decline from within the recv goroutine so it's sequenced correctly.
+		enc, _ := cipher.Encrypt([]byte("FILE_ACK:no"))
+		conn.Send(enc) //nolint:errcheck
 		prog.Send(ui.SystemMsg{Text: fmt.Sprintf("declined %s from %s", name, peerName)})
+		return
+	}
+
+	// Send acceptance and immediately start the receive loop — no gap between
+	// the sender getting the ACK and us being ready to receive chunks.
+	enc, err := cipher.Encrypt([]byte("FILE_ACK:yes"))
+	if err != nil {
+		prog.Send(ui.SystemMsg{Text: "confirm error: " + err.Error()})
+		return
+	}
+	if err := conn.Send(enc); err != nil {
+		prog.Send(ui.SystemMsg{Text: "confirm error: " + err.Error()})
 		return
 	}
 
@@ -369,6 +378,52 @@ func promptName() string {
 		return localUsername()
 	}
 	return name
+}
+
+// lookupGeo calls ip-api.com (opt-in, triggered by /geo) to show peer location.
+func lookupGeo(ip, peerName string, prog *tea.Program) {
+	prog.Send(ui.SystemMsg{Text: fmt.Sprintf("looking up %s...", ip)})
+
+	resp, err := http.Get("http://ip-api.com/json/" + ip + "?fields=status,message,country,countryCode,regionName,city,isp,org")
+	if err != nil {
+		prog.Send(ui.SystemMsg{Text: "geo lookup failed: " + err.Error()})
+		return
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		prog.Send(ui.SystemMsg{Text: "geo lookup failed: " + err.Error()})
+		return
+	}
+
+	var result struct {
+		Status     string `json:"status"`
+		Message    string `json:"message"`
+		City       string `json:"city"`
+		RegionName string `json:"regionName"`
+		Country    string `json:"country"`
+		CountryCode string `json:"countryCode"`
+		ISP        string `json:"isp"`
+		Org        string `json:"org"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		prog.Send(ui.SystemMsg{Text: "geo lookup failed: " + err.Error()})
+		return
+	}
+	if result.Status != "success" {
+		prog.Send(ui.SystemMsg{Text: fmt.Sprintf("geo lookup: %s", result.Message)})
+		return
+	}
+
+	location := fmt.Sprintf("%s, %s, %s", result.City, result.RegionName, result.CountryCode)
+	provider := result.Org
+	if provider == "" {
+		provider = result.ISP
+	}
+	prog.Send(ui.SystemMsg{
+		Text: fmt.Sprintf("%s (%s) — %s — %s", peerName, ip, location, provider),
+	})
 }
 
 // progressBar returns a 20-char filled/empty bar for the given percentage.

@@ -90,5 +90,5 @@ func runShare(_ *cobra.Command, _ []string) error {
 	}
 
 	fmt.Fprintln(os.Stderr, "Connected. Direct P2P. No server.\n")
-	return runChat(result, payload.SessionHex(), myName)
+	return runChat(result, payload.SessionHex(), myName, fmt.Sprintf("%s:%d", publicIP, publicPort))
 }
