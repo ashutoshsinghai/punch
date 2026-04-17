@@ -44,8 +44,16 @@ const (
 	// without blowing the NAT's packet buffer.
 	WindowSize = 64
 
-	ackTimeout    = 3 * time.Second  // retransmit window after no ACK
+	ackTimeout       = 3 * time.Second  // retransmit window after no ACK
 	transferDeadline = 90 * time.Second // max silence before giving up
+
+	// pacingDelay is the minimum gap between consecutive DATA packets.
+	// Without pacing the sender bursts the entire window in microseconds,
+	// overflowing NAT buffers and causing near-100% loss → Go-Back-N
+	// retransmits everything → stuck at 0%.
+	// 1 ms pacing → ceiling of 1400 B / 1 ms ≈ 1.4 MB/s, well within
+	// most NAT/router buffer limits.
+	pacingDelay = time.Millisecond
 )
 
 // headerSize is the fixed 5-byte header (type + seq).
@@ -133,12 +141,13 @@ func Send(conn *net.UDPConn, remote *net.UDPAddr, filePath string, cipher *crypt
 	}
 
 	for windowBase < totalChunks {
-		// Fill the window.
+		// Fill the window, pacing each chunk to avoid bursting the NAT buffer.
 		for nextSeq < windowBase+WindowSize && nextSeq < totalChunks {
 			if err := sendChunk(nextSeq); err != nil {
 				return err
 			}
 			nextSeq++
+			time.Sleep(pacingDelay)
 		}
 
 		// Wait for an ACK or a retransmit timeout.
