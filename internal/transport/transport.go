@@ -56,6 +56,9 @@ type Conn struct {
 	recv   chan []byte // incoming DATA payloads
 }
 
+// keepaliveInterval is how often a PING is sent to keep the NAT hole open.
+const keepaliveInterval = 10 * time.Second
+
 // Wrap takes an already-connected UDP socket and builds a Conn around it.
 func Wrap(conn *net.UDPConn, remote *net.UDPAddr) *Conn {
 	c := &Conn{
@@ -65,7 +68,23 @@ func Wrap(conn *net.UDPConn, remote *net.UDPAddr) *Conn {
 		recv:    make(chan []byte, 64),
 	}
 	go c.readLoop()
+	go c.keepaliveLoop()
 	return c
+}
+
+// keepaliveLoop sends a PING every keepaliveInterval to keep the NAT hole open.
+func (c *Conn) keepaliveLoop() {
+	ticker := time.NewTicker(keepaliveInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			if c.closed.Load() {
+				return
+			}
+			c.Ping() //nolint:errcheck
+		}
+	}
 }
 
 // Send sends payload reliably (with retransmit until ACKed).
