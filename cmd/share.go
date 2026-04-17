@@ -27,6 +27,8 @@ func init() {
 }
 
 func runShare(_ *cobra.Command, _ []string) error {
+	myName := promptName()
+
 	fmt.Fprintln(os.Stderr, "Discovering your public address via STUN...")
 
 	conn, err := punch.BindSocket()
@@ -88,5 +90,5 @@ func runShare(_ *cobra.Command, _ []string) error {
 	}
 
 	fmt.Fprintln(os.Stderr, "Connected. Direct P2P. No server.\n")
-	return runChat(result, payload.SessionHex())
+	return runChat(result, payload.SessionHex(), myName)
 }

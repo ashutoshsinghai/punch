@@ -23,6 +23,8 @@ func init() {
 }
 
 func runJoin(_ *cobra.Command, args []string) error {
+	myName := promptName()
+
 	rawToken := args[0]
 
 	payload, err := token.Decode(rawToken)
@@ -71,5 +73,5 @@ func runJoin(_ *cobra.Command, args []string) error {
 	}
 
 	fmt.Fprintln(os.Stderr, "Connected. Direct P2P. No server.\n")
-	return runChat(result, payload.SessionHex())
+	return runChat(result, payload.SessionHex(), myName)
 }
