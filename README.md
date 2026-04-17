@@ -6,23 +6,44 @@ No server. No accounts. Just a short token you share over WhatsApp.
 
 ```
 alice:  punch share
-        → Token: 5pmM-Z67o-HtRw-Lywn-z
+        → Token: 5pmM-Z9oL-z
         → Send this to your friend.
 
-bob:    punch join 5pmM-Z67o-HtRw-Lywn-z
+        Peer's reply token: _   ← paste what Bob sends back
+
+bob:    punch join 5pmM-Z9oL-z
+        → Reply token: HtRw-Lywn-x
+        → Send this back to Alice.
         → Punching through NAT...
-        → Connected to alice. Direct P2P. No server.
+        → Connected. Direct P2P. No server.
 ```
 
 ## Features
 
-- **Chat** — real-time encrypted terminal chat, no history stored anywhere
+- **Chat** — real-time terminal chat, no history stored anywhere
 - **File transfer** — chunked send/receive with SHA-256 hash verification and a progress bar
 - **Pipe** — stream stdin directly to a peer (`kubectl logs pod | punch pipe`)
-- **Zero middleman** — if hole punching fails, punch fails loudly. No silent relay fallback.
-- **End-to-end encrypted** — ChaCha20-Poly1305, key derived from the session token
-- **Expiring tokens** — 10 minutes by default, replayed tokens rejected
+- **End-to-end encrypted** — all data encrypted with ChaCha20-Poly1305 before it leaves your machine. The session key is derived from the token via HKDF-SHA256. Even if someone intercepts your packets, they see nothing.
+- **Zero middleman** — if hole punching fails, punch fails loudly. No silent relay fallback, no data touches a server.
 - **Single binary** — no runtime, no install, drop it anywhere on your PATH
+
+## Security
+
+punch is end-to-end encrypted by design, not as an afterthought.
+
+When Alice runs `punch share`, a random 2-byte session key is generated and embedded in the token. Both Alice and Bob derive a ChaCha20-Poly1305 encryption key from it using HKDF-SHA256. Every message, file chunk, and pipe byte is encrypted before leaving the machine and decrypted on arrival.
+
+```
+token session bytes → HKDF-SHA256 → ChaCha20-Poly1305 key
+```
+
+**What this means in practice:**
+- No one can read your messages or files in transit — not your ISP, not your router, not anyone on the network
+- The token shared over WhatsApp is the only shared secret — keep it private
+- No keys are stored anywhere, no accounts, no telemetry
+- The connection is ephemeral — when both sides exit, the session is gone forever
+
+The only data that touches any external service is a single UDP packet to Google's STUN server (`stun.l.google.com`) to discover your public IP — no content, just an IP lookup.
 
 ## Installation
 
@@ -82,7 +103,7 @@ Download the right binary for your OS from [GitHub Releases](https://github.com/
 
 ---
 
-### Build from source (requires Go 1.21+)
+### Build from source
 
 ```bash
 go install github.com/ashutoshsinghai/punch@latest
@@ -93,11 +114,18 @@ go install github.com/ashutoshsinghai/punch@latest
 ### Chat
 
 ```bash
-# Alice starts a session
+# Step 1 — Alice starts a session
 punch share
+# → Token: 5pmM-Z9oL-z
+# → Send this token to Bob over WhatsApp/Signal
 
-# Bob connects
-punch join <token>
+# Step 2 — Bob joins and gets a reply token
+punch join 5pmM-Z9oL-z
+# → Reply token: HtRw-Lywn-x
+# → Bob sends this reply token back to Alice
+
+# Step 3 — Alice enters Bob's reply token
+# → Both punch through NAT simultaneously → connected
 ```
 
 Type messages and hit Enter. `/quit` or Ctrl+C to exit.
@@ -118,7 +146,7 @@ punch send report.pdf <token>      # Bob sends (token from Alice)
 
 ```bash
 # Stream anything to a peer
-kubectl logs my-pod | punch pipe       # generates a token, stream stdout
+kubectl logs my-pod | punch pipe       # generates a token, streams stdout
 
 punch pipe <token> > output.txt        # peer receives and writes to file
 ```
@@ -136,20 +164,21 @@ punch pipe <token> > output.txt        # peer receives and writes to file
 | `punch upgrade` | Upgrade to the latest version |
 | `punch help` | Show usage |
 
-### Flags
-
-```bash
-punch share --expire 30m        # custom token expiry (default 10m)
-punch share --token base58      # compact token format instead of word groups
-```
-
 ## How it works
 
-The token encodes Alice's public IP, local IP, port, a random session ID, and an expiry timestamp — all in 18 binary bytes (~25 base58 characters).
+**Token format:** 8 bytes → ~11 base58 characters (e.g. `5pmM-Z9oL-z`)
 
-Bob decodes the token and sends UDP probe packets to Alice's address. This opens a "hole" in both NATs simultaneously. Alice replies the moment she receives Bob's first probe. Both holes are open — direct UDP traffic flows.
+```
+[4 bytes public IPv4] [2 bytes port] [2 bytes session]
+```
 
-All data is encrypted with ChaCha20-Poly1305 using a key derived from the session ID via HKDF-SHA256.
+The port and IP come from a STUN lookup (`stun.l.google.com`) performed from the same UDP socket that will be used for the connection — so the NAT mapping is accurate.
+
+**Two-token exchange:** Alice shares her token (IP + port + session). Bob generates a reply token with his IP + port + the same session. Both sides now know each other's public address.
+
+**Simultaneous hole punching:** Both peers start sending UDP probe packets to each other at the same time. This opens a hole in both NATs simultaneously. Transport keepalives (every 10s) keep the hole open for the lifetime of the session.
+
+**Encryption:** All data is encrypted with ChaCha20-Poly1305 using a key derived from the 2-byte session via HKDF-SHA256, before any packet leaves the machine.
 
 ### NAT compatibility
 

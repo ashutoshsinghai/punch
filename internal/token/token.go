@@ -1,10 +1,11 @@
 // Package token encodes/decodes punch session tokens.
 //
-// Wire format (14 bytes, binary):
+// Wire format (8 bytes, binary):
 //
-//	[4 bytes public IPv4] [2 bytes port] [4 bytes session] [4 bytes expiry uint32]
+//	[4 bytes public IPv4] [2 bytes port] [2 bytes session]
 //
-// 14 bytes → ~19 base58 chars → displayed as groups of 4: "xxxx-xxxx-xxxx-xxxx-xxx"
+// 8 bytes → ~11 base58 chars → displayed as groups of 4: "xxxx-xxxx-xxx"
+// No expiry field — the token is valid as long as the process is running.
 package token
 
 import (
@@ -13,27 +14,22 @@ import (
 	"fmt"
 	"net"
 	"strings"
-	"time"
 )
 
 // Payload is the data encoded in a token.
 type Payload struct {
 	IP      string  // public IP as discovered via STUN
 	Port    uint16
-	Session [4]byte // random session bytes, shared secret for key derivation
-	Exp     uint32  // unix timestamp (seconds)
+	Session [2]byte // random session bytes, shared secret for key derivation
 }
 
-// DefaultExpiry is how long a token is valid.
-const DefaultExpiry = 10 * time.Minute
-
 // payloadSize is the fixed binary size of a serialised Payload.
-const payloadSize = 4 + 2 + 4 + 4 // 14 bytes
+const payloadSize = 4 + 2 + 2 // 8 bytes
 
 // base58 alphabet (Bitcoin variant — excludes 0, O, I, l to avoid visual confusion).
 const base58Alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
-// Encode serialises payload → 14-byte binary → base58 string (~19 chars).
+// Encode serialises payload → 8-byte binary → base58 string (~11 chars).
 func Encode(p Payload) (string, error) {
 	pubIP := net.ParseIP(p.IP).To4()
 	if pubIP == nil {
@@ -43,8 +39,7 @@ func Encode(p Payload) (string, error) {
 	buf := make([]byte, payloadSize)
 	copy(buf[0:4], pubIP)
 	binary.BigEndian.PutUint16(buf[4:6], p.Port)
-	copy(buf[6:10], p.Session[:])
-	binary.BigEndian.PutUint32(buf[10:14], p.Exp)
+	copy(buf[6:8], p.Session[:])
 
 	return base58Enc(buf), nil
 }
@@ -67,12 +62,7 @@ func Decode(tok string) (Payload, error) {
 	var p Payload
 	p.IP = net.IP(buf[0:4]).String()
 	p.Port = binary.BigEndian.Uint16(buf[4:6])
-	copy(p.Session[:], buf[6:10])
-	p.Exp = binary.BigEndian.Uint32(buf[10:14])
-
-	if uint32(time.Now().Unix()) > p.Exp {
-		return Payload{}, fmt.Errorf("token expired")
-	}
+	copy(p.Session[:], buf[6:8])
 
 	return p, nil
 }
@@ -85,31 +75,20 @@ func (p Payload) SessionHex() string {
 // NewReplyPayload builds a reply token for the join side to send back to the
 // share side. It reuses the original session so both peers derive the same
 // encryption key.
-func NewReplyPayload(publicIP string, port uint16, session [4]byte) (Payload, error) {
-	pubIP := net.ParseIP(publicIP).To4()
-	if pubIP == nil {
+func NewReplyPayload(publicIP string, port uint16, session [2]byte) (Payload, error) {
+	if net.ParseIP(publicIP).To4() == nil {
 		return Payload{}, fmt.Errorf("invalid public IPv4 address: %s", publicIP)
 	}
-	return Payload{
-		IP:      publicIP,
-		Port:    port,
-		Session: session,
-		Exp:     uint32(time.Now().Add(DefaultExpiry).Unix()),
-	}, nil
+	return Payload{IP: publicIP, Port: port, Session: session}, nil
 }
 
-// NewPayload builds a Payload with a fresh random session and given expiry.
-func NewPayload(publicIP string, port uint16, expiry time.Duration) (Payload, error) {
-	var session [4]byte
+// NewPayload builds a Payload with a fresh random session.
+func NewPayload(publicIP string, port uint16) (Payload, error) {
+	var session [2]byte
 	if _, err := rand.Read(session[:]); err != nil {
 		return Payload{}, fmt.Errorf("failed to generate session: %w", err)
 	}
-	return Payload{
-		IP:      publicIP,
-		Port:    port,
-		Session: session,
-		Exp:     uint32(time.Now().Add(expiry).Unix()),
-	}, nil
+	return Payload{IP: publicIP, Port: port, Session: session}, nil
 }
 
 // Words formats the token in human-readable dash-separated groups of 4.

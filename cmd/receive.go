@@ -44,7 +44,7 @@ func runReceive(_ *cobra.Command, args []string) error {
 		if err != nil {
 			return err
 		}
-		payload, err := token.NewPayload(publicIP, port, token.DefaultExpiry)
+		payload, err := token.NewPayload(publicIP, port)
 		if err != nil {
 			return err
 		}

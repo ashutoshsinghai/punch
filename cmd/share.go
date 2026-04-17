@@ -6,7 +6,6 @@ import (
 	"net"
 	"os"
 	"strings"
-	"time"
 
 	"github.com/ashutoshsinghai/punch/internal/punch"
 	"github.com/ashutoshsinghai/punch/internal/stun"
@@ -14,10 +13,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var (
-	shareExpire string
-	shareFormat string
-)
+var shareFormat string
 
 var shareCmd = &cobra.Command{
 	Use:   "share",
@@ -26,17 +22,11 @@ var shareCmd = &cobra.Command{
 }
 
 func init() {
-	shareCmd.Flags().StringVar(&shareExpire, "expire", "10m", "Token expiry duration (e.g. 10m, 30m, 1h)")
 	shareCmd.Flags().StringVar(&shareFormat, "token", "words", "Token format: words | base58")
 	rootCmd.AddCommand(shareCmd)
 }
 
 func runShare(_ *cobra.Command, _ []string) error {
-	expiry, err := time.ParseDuration(shareExpire)
-	if err != nil {
-		return fmt.Errorf("invalid expiry %q: %w", shareExpire, err)
-	}
-
 	fmt.Fprintln(os.Stderr, "Discovering your public address via STUN...")
 
 	conn, err := punch.BindSocket()
@@ -50,7 +40,7 @@ func runShare(_ *cobra.Command, _ []string) error {
 	}
 	fmt.Fprintf(os.Stderr, "Your public address: %s:%d\n", publicIP, publicPort)
 
-	payload, err := token.NewPayload(publicIP, publicPort, expiry)
+	payload, err := token.NewPayload(publicIP, publicPort)
 	if err != nil {
 		return fmt.Errorf("could not create token: %w", err)
 	}
@@ -66,7 +56,7 @@ func runShare(_ *cobra.Command, _ []string) error {
 	}
 
 	fmt.Printf("\nToken: %s\n", display)
-	fmt.Printf("Send this to your peer over WhatsApp/Signal. Expires in %s.\n\n", expiry)
+	fmt.Println("Send this to your peer over WhatsApp/Signal.\n")
 	fmt.Print("Peer's reply token: ")
 
 	reader := bufio.NewReader(os.Stdin)
