@@ -19,12 +19,12 @@ type Message struct {
 // SendFn is called by the UI when the user submits a message.
 type SendFn func(msg string) error
 
-// knownCommands is the set of recognised slash-commands (prefix match for /send).
-var knownCommands = []string{"/quit", "/exit", "/ping", "/ip", "/info", "/geo", "/send ", "/clear", "/help", "/ls"}
+// knownCommands is the set of recognised slash-commands (prefix match for /send and /qsend).
+var knownCommands = []string{"/quit", "/exit", "/ping", "/ip", "/info", "/geo", "/send ", "/qsend ", "/clear", "/help", "/ls"}
 
 func isKnownCommand(text string) bool {
 	for _, c := range knownCommands {
-		if strings.HasPrefix(c, "/send") {
+		if strings.HasPrefix(c, "/send") || strings.HasPrefix(c, "/qsend") {
 			if strings.HasPrefix(text, c) {
 				return true
 			}
@@ -261,7 +261,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					"/ping          — measure round-trip time to peer",
 					"/ip  /info     — show your and peer's public address",
 					"/geo           — look up peer's location",
-					"/send <file>   — send a file to peer",
+					"/send <file>   — send a file to peer (custom ARQ)",
+				"/qsend <file>  — send a file via QUIC (benchmark)",
 					"/ls            — list files in current directory",
 					"/clear         — clear the chat window",
 					"/help          — show this help",
@@ -291,7 +292,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			// Known commands handled by cmd layer — don't echo locally.
 			isCmd := text == "/ping" || text == "/ip" || text == "/info" || text == "/geo" ||
-				strings.HasPrefix(text, "/send ") || text == "/ls"
+				strings.HasPrefix(text, "/send ") || strings.HasPrefix(text, "/qsend ") || text == "/ls"
 			if !isCmd {
 				m.messages = append(m.messages, Message{
 					From: m.myName,

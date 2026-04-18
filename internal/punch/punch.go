@@ -204,6 +204,71 @@ func RandomPort() (uint16, error) {
 	return uint16(port), nil
 }
 
+// ListenRaw is like Listen but returns the raw *net.UDPConn without wrapping
+// it in transport.Conn. Use this when handing the socket to a library that
+// manages its own reliability layer (e.g. QUIC).
+func ListenRaw(localPort uint16) (*net.UDPConn, *net.UDPAddr, error) {
+	addr := &net.UDPAddr{Port: int(localPort)}
+	conn, err := net.ListenUDP("udp4", addr)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to bind UDP port %d: %w", localPort, err)
+	}
+	conn.SetReadDeadline(time.Now().Add(probeTimeout))
+	buf := make([]byte, 512)
+	for {
+		n, remote, err := conn.ReadFromUDP(buf)
+		if err != nil {
+			conn.Close()
+			return nil, nil, fmt.Errorf("timed out waiting for peer (no connection within %s)", probeTimeout)
+		}
+		if n >= len(probeMsg) && string(buf[:len(probeMsg)]) == probeMsg {
+			conn.SetReadDeadline(time.Time{})
+			conn.WriteToUDP([]byte(probeMsg), remote) //nolint:errcheck
+			return conn, remote, nil
+		}
+	}
+}
+
+// DialRaw is like Dial but returns the raw *net.UDPConn without wrapping it
+// in transport.Conn. Use this when handing the socket to a library that
+// manages its own reliability layer (e.g. QUIC).
+func DialRaw(remoteIP string, remotePort uint16) (*net.UDPConn, *net.UDPAddr, error) {
+	remote := &net.UDPAddr{
+		IP:   net.ParseIP(remoteIP),
+		Port: int(remotePort),
+	}
+	if remote.IP == nil {
+		return nil, nil, fmt.Errorf("invalid remote IP: %s", remoteIP)
+	}
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{Port: 0})
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to bind local UDP socket: %w", err)
+	}
+	deadline := time.Now().Add(probeTimeout)
+	ticker := time.NewTicker(probeInterval)
+	defer ticker.Stop()
+	probe := []byte(probeMsg)
+	buf := make([]byte, 512)
+	for time.Now().Before(deadline) {
+		select {
+		case <-ticker.C:
+			conn.WriteToUDP(probe, remote) //nolint:errcheck
+		default:
+		}
+		conn.SetReadDeadline(time.Now().Add(probeInterval))
+		n, from, err := conn.ReadFromUDP(buf)
+		if err != nil {
+			continue
+		}
+		if from.String() == remote.String() && n >= len(probeMsg) && string(buf[:len(probeMsg)]) == probeMsg {
+			conn.SetReadDeadline(time.Time{})
+			return conn, remote, nil
+		}
+	}
+	conn.Close()
+	return nil, nil, fmt.Errorf("no response from %s:%d within %s", remoteIP, remotePort, probeTimeout)
+}
+
 // BindSocket creates a new UDP socket on a random available port and
 // returns it ready for use (STUN discovery, hole punching, etc.).
 func BindSocket() (*net.UDPConn, error) {

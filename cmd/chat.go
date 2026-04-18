@@ -17,6 +17,7 @@ import (
 	"github.com/ashutoshsinghai/punch/internal/crypto"
 	"github.com/ashutoshsinghai/punch/internal/filetransfer"
 	"github.com/ashutoshsinghai/punch/internal/punch"
+	"github.com/ashutoshsinghai/punch/internal/qtransfer"
 	"github.com/ashutoshsinghai/punch/internal/stun"
 	"github.com/ashutoshsinghai/punch/internal/transport"
 	"github.com/ashutoshsinghai/punch/ui"
@@ -38,6 +39,8 @@ func runChat(result *punch.Result, session, myName, myPublicAddr string) error {
 	confirmCh := make(chan bool, 1)
 	// ftAcceptCh delivers the peer's FT port on acceptance, or -1 on decline.
 	ftAcceptCh := make(chan int, 1)
+	// qftAcceptCh is the equivalent for QUIC file transfers.
+	qftAcceptCh := make(chan int, 1)
 
 	var prog *tea.Program
 
@@ -68,6 +71,11 @@ func runChat(result *punch.Result, session, myName, myPublicAddr string) error {
 		case strings.HasPrefix(msg, "/send "):
 			path := strings.TrimSpace(strings.TrimPrefix(msg, "/send "))
 			go chatSendFile(path, result.Conn, cipher, prog, ftAcceptCh, peerName, result.Remote.IP.String())
+			return nil
+
+		case strings.HasPrefix(msg, "/qsend "):
+			path := strings.TrimSpace(strings.TrimPrefix(msg, "/qsend "))
+			go chatQSendFile(path, result.Conn, cipher, prog, qftAcceptCh, peerName, result.Remote.IP.String())
 			return nil
 
 		case msg == "/ls":
@@ -161,6 +169,26 @@ func runChat(result *punch.Result, session, myName, myPublicAddr string) error {
 			case text == "FILE_DECLINE":
 				select {
 				case ftAcceptCh <- -1:
+				default:
+				}
+
+			case strings.HasPrefix(text, "QFILE_OFFER:"):
+				go handleIncomingQFileOffer(text, result.Conn, cipher, prog, confirmCh, qftAcceptCh, peerName, result.Remote.IP.String())
+
+			case strings.HasPrefix(text, "QFILE_ACCEPT:"):
+				portStr := strings.TrimPrefix(text, "QFILE_ACCEPT:")
+				port, err := strconv.Atoi(portStr)
+				if err != nil {
+					port = -1
+				}
+				select {
+				case qftAcceptCh <- port:
+				default:
+				}
+
+			case text == "QFILE_DECLINE":
+				select {
+				case qftAcceptCh <- -1:
 				default:
 				}
 
@@ -400,6 +428,212 @@ func handleIncomingFileOffer(offer string, chatConn *transport.Conn, cipher *cry
 		return
 	}
 	prog.Send(ui.SystemMsg{Text: fmt.Sprintf("saved %s → %s  (%s in %s  —  %s/s)",
+		name, absPath, humanBytes(int(size)), elapsed.Round(time.Millisecond), humanBytes(int(float64(size)/elapsed.Seconds())))})
+}
+
+// chatQSendFile is the QUIC equivalent of chatSendFile.
+// It announces a QFILE_OFFER, waits for acceptance, punches a dedicated UDP
+// socket, then streams the file via QUIC instead of the custom ARQ protocol.
+func chatQSendFile(path string, chatConn *transport.Conn, cipher *crypto.Cipher, prog *tea.Program, qftAcceptCh chan int, peerName, peerChatIP string) {
+	info, err := os.Stat(path)
+	if err != nil {
+		prog.Send(ui.SystemMsg{Text: "qsend error: " + err.Error()})
+		return
+	}
+	name := filepath.Base(path)
+	total := info.Size()
+
+	ftConn, err := punch.BindSocket()
+	if err != nil {
+		prog.Send(ui.SystemMsg{Text: "qsend error (bind FT socket): " + err.Error()})
+		return
+	}
+	defer ftConn.Close()
+
+	_, ftPublicPort, err := stun.Discover(ftConn)
+	if err != nil {
+		prog.Send(ui.SystemMsg{Text: "qsend error (STUN): " + err.Error()})
+		return
+	}
+
+	// QFILE_OFFER:<size>:<sender-ft-port>:<name>
+	offer := fmt.Sprintf("QFILE_OFFER:%d:%d:%s", total, ftPublicPort, name)
+	enc, err := cipher.Encrypt([]byte(offer))
+	if err != nil {
+		prog.Send(ui.SystemMsg{Text: "qsend error: " + err.Error()})
+		return
+	}
+	if err := chatConn.Send(enc); err != nil {
+		prog.Send(ui.SystemMsg{Text: "qsend error: " + err.Error()})
+		return
+	}
+
+	prog.Send(ui.ProgressMsg{Text: fmt.Sprintf("waiting for %s to accept %s (%s) [QUIC]...", peerName, name, humanBytes(int(total)))})
+
+	stopKeepalive := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(20 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				stun.Discover(ftConn) //nolint:errcheck
+			case <-stopKeepalive:
+				return
+			}
+		}
+	}()
+
+	var peerFTPort int
+	select {
+	case peerFTPort = <-qftAcceptCh:
+	case <-time.After(60 * time.Second):
+		close(stopKeepalive)
+		prog.Send(ui.ProgressMsg{})
+		prog.Send(ui.SystemMsg{Text: fmt.Sprintf("no response from %s — QUIC transfer cancelled", peerName)})
+		return
+	}
+	close(stopKeepalive)
+
+	if peerFTPort < 0 {
+		prog.Send(ui.ProgressMsg{})
+		prog.Send(ui.SystemMsg{Text: fmt.Sprintf("%s declined %s", peerName, name)})
+		return
+	}
+
+	peerFTAddr := &net.UDPAddr{IP: net.ParseIP(peerChatIP), Port: peerFTPort}
+
+	prog.Send(ui.ProgressMsg{Text: fmt.Sprintf("punching FT channel for QUIC to %s...", peerName)})
+	if err := punch.SoloPunch(ftConn, peerFTAddr); err != nil {
+		prog.Send(ui.ProgressMsg{})
+		prog.Send(ui.SystemMsg{Text: "QUIC FT punch failed: " + err.Error()})
+		return
+	}
+
+	prog.Send(ui.ProgressMsg{Text: fmt.Sprintf("sending %s (%s) via QUIC...", name, humanBytes(int(total)))})
+
+	ftStart := time.Now()
+	var speedLastBytes int64
+	speedLastTime := ftStart
+	var speedStr string
+	err = qtransfer.Send(ftConn, peerFTAddr, path, func(sent, tot int64) {
+		if tot == 0 {
+			return
+		}
+		now := time.Now()
+		if now.Sub(speedLastTime) >= 250*time.Millisecond {
+			speed := float64(sent-speedLastBytes) / now.Sub(speedLastTime).Seconds()
+			speedStr = humanBytes(int(speed)) + "/s"
+			speedLastBytes = sent
+			speedLastTime = now
+		}
+		pct := int(sent * 100 / tot)
+		prog.Send(ui.ProgressMsg{Text: fmt.Sprintf("%s  %s  %d%%  %s [QUIC]", progressBar(pct), name, pct, speedStr)})
+	})
+	elapsed := time.Since(ftStart)
+	prog.Send(ui.ProgressMsg{})
+	if err != nil {
+		prog.Send(ui.SystemMsg{Text: fmt.Sprintf("QUIC send error (%s): %s", name, err.Error())})
+		return
+	}
+	prog.Send(ui.SystemMsg{Text: fmt.Sprintf("sent %s (%s) via QUIC in %s  —  %s/s",
+		name, humanBytes(int(total)), elapsed.Round(time.Millisecond), humanBytes(int(float64(total)/elapsed.Seconds())))})
+}
+
+// handleIncomingQFileOffer handles a QFILE_OFFER from the peer.
+// It mirrors handleIncomingFileOffer but uses QUIC for the actual transfer.
+func handleIncomingQFileOffer(offer string, chatConn *transport.Conn, cipher *crypto.Cipher, prog *tea.Program, confirmCh chan bool, qftAcceptCh chan int, peerName, peerChatIP string) {
+	// QFILE_OFFER:<size>:<sender-ft-port>:<name>
+	parts := strings.SplitN(offer, ":", 4)
+	if len(parts) != 4 {
+		return
+	}
+	size, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil {
+		return
+	}
+	senderFTPort, err := strconv.Atoi(parts[2])
+	if err != nil {
+		return
+	}
+	name := parts[3]
+
+	prog.Send(ui.ConfirmMsg{
+		Text: fmt.Sprintf("%s wants to send %s (%s) via QUIC", peerName, name, humanBytes(int(size))),
+	})
+
+	var accepted bool
+	select {
+	case accepted = <-confirmCh:
+	case <-time.After(60 * time.Second):
+		sendChatSignal(chatConn, cipher, "QFILE_DECLINE")
+		prog.Send(ui.SystemMsg{Text: fmt.Sprintf("QUIC transfer from %s timed out — auto-declined", peerName)})
+		return
+	}
+
+	if !accepted {
+		sendChatSignal(chatConn, cipher, "QFILE_DECLINE")
+		prog.Send(ui.SystemMsg{Text: fmt.Sprintf("declined %s from %s", name, peerName)})
+		return
+	}
+
+	ftConn, err := punch.BindSocket()
+	if err != nil {
+		prog.Send(ui.SystemMsg{Text: "QUIC accept error (bind): " + err.Error()})
+		sendChatSignal(chatConn, cipher, "QFILE_DECLINE")
+		return
+	}
+	defer ftConn.Close()
+
+	_, myFTPort, err := stun.Discover(ftConn)
+	if err != nil {
+		prog.Send(ui.SystemMsg{Text: "QUIC accept error (STUN): " + err.Error()})
+		sendChatSignal(chatConn, cipher, "QFILE_DECLINE")
+		return
+	}
+
+	sendChatSignal(chatConn, cipher, fmt.Sprintf("QFILE_ACCEPT:%d", myFTPort))
+	_ = qftAcceptCh // not used on receiver side
+
+	senderFTAddr := &net.UDPAddr{IP: net.ParseIP(peerChatIP), Port: senderFTPort}
+
+	prog.Send(ui.ProgressMsg{Text: fmt.Sprintf("punching FT channel for QUIC to %s...", peerName)})
+	if err := punch.SoloPunch(ftConn, senderFTAddr); err != nil {
+		prog.Send(ui.ProgressMsg{})
+		prog.Send(ui.SystemMsg{Text: "QUIC FT punch failed: " + err.Error()})
+		return
+	}
+
+	prog.Send(ui.SystemMsg{Text: fmt.Sprintf("receiving %s (%s) via QUIC...", name, humanBytes(int(size)))})
+
+	savePath := name
+	absPath, _ := filepath.Abs(savePath)
+
+	ftStart := time.Now()
+	var speedLastBytes int64
+	speedLastTime := ftStart
+	var speedStr string
+	err = qtransfer.Receive(ftConn, savePath, func(recv, tot int64) {
+		if tot == 0 {
+			return
+		}
+		now := time.Now()
+		if now.Sub(speedLastTime) >= 250*time.Millisecond {
+			speed := float64(recv-speedLastBytes) / now.Sub(speedLastTime).Seconds()
+			speedStr = humanBytes(int(speed)) + "/s"
+			speedLastBytes = recv
+			speedLastTime = now
+		}
+		pct := int(recv * 100 / tot)
+		prog.Send(ui.ProgressMsg{Text: fmt.Sprintf("%s  %s  %d%%  %s [QUIC]", progressBar(pct), name, pct, speedStr)})
+	})
+	elapsed := time.Since(ftStart)
+	prog.Send(ui.ProgressMsg{})
+	if err != nil {
+		prog.Send(ui.SystemMsg{Text: fmt.Sprintf("QUIC receive error (%s): %s", name, err.Error())})
+		return
+	}
+	prog.Send(ui.SystemMsg{Text: fmt.Sprintf("saved %s → %s  (%s via QUIC in %s  —  %s/s)",
 		name, absPath, humanBytes(int(size)), elapsed.Round(time.Millisecond), humanBytes(int(float64(size)/elapsed.Seconds())))})
 }
 
