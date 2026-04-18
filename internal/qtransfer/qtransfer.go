@@ -40,9 +40,26 @@ import (
 )
 
 const (
-	alpn           = "punch-ft/1"
+	alpn            = "punch-ft/1"
 	transferTimeout = 10 * time.Minute
+
+	// udpBufSize is the socket buffer we request before handing a conn to QUIC.
+	// quic-go warns (and links to its wiki) if the OS buffer is below ~7 MB.
+	// We set it here so the warning is suppressed on systems that allow it.
+	// On restricted Linux hosts the OS may silently cap it; that's fine.
+	udpBufSize = 7 << 20 // 7 MB
 )
+
+// tuneBuffers tries to enlarge the UDP socket buffers before handing the conn
+// to quic-go. This suppresses quic-go's buffer-size warning on systems that
+// allow large buffers (macOS, tuned Linux). On restricted hosts the OS silently
+// caps the value — the warning may still appear but the transfer still works.
+func tuneBuffers(conn net.PacketConn) {
+	if u, ok := conn.(*net.UDPConn); ok {
+		_ = u.SetReadBuffer(udpBufSize)
+		_ = u.SetWriteBuffer(udpBufSize)
+	}
+}
 
 // ServerTLSConfig generates a self-signed TLS config for the receiver (QUIC server side).
 // Auth comes from the session key already shared via the token.
@@ -86,6 +103,8 @@ func ClientTLSConfig() *tls.Config {
 // conn must be a hole-punched UDP socket pointing toward remote.
 // progress is called with (bytesSent, totalBytes) after each write; may be nil.
 func Send(conn net.PacketConn, remote net.Addr, filePath string, progress func(int64, int64)) error {
+	tuneBuffers(conn)
+
 	f, err := os.Open(filePath)
 	if err != nil {
 		return fmt.Errorf("open %s: %w", filePath, err)
@@ -154,6 +173,8 @@ func Send(conn net.PacketConn, remote net.Addr, filePath string, progress func(i
 // conn must be a hole-punched UDP socket (the NAT hole must already be open).
 // progress is called with (bytesReceived, totalBytes); may be nil.
 func Receive(conn net.PacketConn, savePath string, progress func(int64, int64)) error {
+	tuneBuffers(conn)
+
 	tlsConf, err := ServerTLSConfig()
 	if err != nil {
 		return err
