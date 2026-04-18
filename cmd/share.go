@@ -60,16 +60,7 @@ func runShare(_ *cobra.Command, _ []string) error {
 	}
 
 	fmt.Printf("\nToken: %s\n", display)
-	fmt.Print("Press 'c' to copy to clipboard, any other key to skip: ")
-	if key := readSingleKey(); key == 'c' || key == 'C' {
-		if err := clipboard.WriteAll(display); err == nil {
-			fmt.Println("copied!")
-		} else {
-			fmt.Println("copy failed: " + err.Error())
-		}
-	} else {
-		fmt.Println()
-	}
+	offerClipboard(display)
 	fmt.Println("Send this to your peer over WhatsApp/Signal.\n")
 	fmt.Print("Peer's reply token: ")
 
@@ -103,6 +94,28 @@ func runShare(_ *cobra.Command, _ []string) error {
 
 	fmt.Fprintln(os.Stderr, "Connected. Direct P2P. No server.\n")
 	return runChat(result, payload.SessionHex(), myName, fmt.Sprintf("%s:%d", publicIP, publicPort))
+}
+
+// offerClipboard prompts the user to copy text to the clipboard.
+// On systems without clipboard support (headless Linux without xclip/xsel/
+// wl-clipboard), the prompt is skipped silently rather than showing a
+// cryptic library error after the user has already pressed a key.
+func offerClipboard(text string) {
+	// Probe availability without touching the actual clipboard content.
+	if _, err := clipboard.ReadAll(); err != nil {
+		fmt.Println()
+		return
+	}
+	fmt.Print("Press 'c' to copy to clipboard, any other key to skip: ")
+	if key := readSingleKey(); key == 'c' || key == 'C' {
+		if err := clipboard.WriteAll(text); err == nil {
+			fmt.Println("copied!")
+		} else {
+			fmt.Println()
+		}
+	} else {
+		fmt.Println()
+	}
 }
 
 // readSingleKey reads one keypress without requiring Enter.
