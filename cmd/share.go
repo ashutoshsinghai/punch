@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/atotto/clipboard"
 	"github.com/ashutoshsinghai/punch/internal/punch"
 	"github.com/ashutoshsinghai/punch/internal/stun"
 	"github.com/ashutoshsinghai/punch/internal/token"
@@ -58,6 +59,9 @@ func runShare(_ *cobra.Command, _ []string) error {
 	}
 
 	fmt.Printf("\nToken: %s\n", display)
+	if err := clipboard.WriteAll(display); err == nil {
+		fmt.Println("(copied to clipboard)")
+	}
 	fmt.Println("Send this to your peer over WhatsApp/Signal.\n")
 	fmt.Print("Peer's reply token: ")
 
