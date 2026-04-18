@@ -5,6 +5,7 @@ import (
 	"net"
 	"os"
 
+	"github.com/atotto/clipboard"
 	"github.com/ashutoshsinghai/punch/internal/punch"
 	"github.com/ashutoshsinghai/punch/internal/stun"
 	"github.com/ashutoshsinghai/punch/internal/token"
@@ -56,7 +57,18 @@ func runJoin(_ *cobra.Command, args []string) error {
 		return fmt.Errorf("could not encode reply token: %w", err)
 	}
 
-	fmt.Printf("\nReply token: %s\n", token.Words(replyTok))
+	replyWords := token.Words(replyTok)
+	fmt.Printf("\nReply token: %s\n", replyWords)
+	fmt.Print("Press 'c' to copy to clipboard, any other key to skip: ")
+	if key := readSingleKey(); key == 'c' || key == 'C' {
+		if err := clipboard.WriteAll(replyWords); err == nil {
+			fmt.Println("copied!")
+		} else {
+			fmt.Println("copy failed: " + err.Error())
+		}
+	} else {
+		fmt.Println()
+	}
 	fmt.Println("Send this back to your peer over WhatsApp/Signal.")
 	fmt.Fprintln(os.Stderr, "\nPunching through NAT (keeping hole open while peer confirms)...")
 

@@ -70,6 +70,28 @@ func runChat(result *punch.Result, session, myName, myPublicAddr string) error {
 			go chatSendFile(path, result.Conn, cipher, prog, ftAcceptCh, peerName, result.Remote.IP.String())
 			return nil
 
+		case msg == "/ls":
+			entries, err := os.ReadDir(".")
+			if err != nil {
+				prog.Send(ui.SystemMsg{Text: "ls error: " + err.Error()})
+				return nil
+			}
+			var sb strings.Builder
+			for _, e := range entries {
+				if e.IsDir() {
+					sb.WriteString("  " + e.Name() + "/\n")
+				} else {
+					info, _ := e.Info()
+					if info != nil {
+						sb.WriteString(fmt.Sprintf("  %-40s %s\n", e.Name(), humanBytes(int(info.Size()))))
+					} else {
+						sb.WriteString("  " + e.Name() + "\n")
+					}
+				}
+			}
+			prog.Send(ui.SystemMsg{Text: strings.TrimRight(sb.String(), "\n")})
+			return nil
+
 		case msg == "__CONFIRM__:yes":
 			confirmCh <- true
 			return nil
@@ -142,6 +164,9 @@ func runChat(result *punch.Result, session, myName, myPublicAddr string) error {
 				default:
 				}
 
+			case text == "__BYE__":
+				prog.Send(ui.SystemMsg{Text: peerName + " has left the chat"})
+
 			default:
 				prog.Send(ui.IncomingMsg{From: peerName, Body: text})
 			}
@@ -151,6 +176,8 @@ func runChat(result *punch.Result, session, myName, myPublicAddr string) error {
 	if _, err := prog.Run(); err != nil && err != tea.ErrProgramKilled {
 		return err
 	}
+	// Notify the peer before closing.
+	sendChatSignal(result.Conn, cipher, "__BYE__")
 	result.Conn.Close()
 	return nil
 }

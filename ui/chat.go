@@ -20,12 +20,11 @@ type Message struct {
 type SendFn func(msg string) error
 
 // knownCommands is the set of recognised slash-commands (prefix match for /send).
-var knownCommands = []string{"/quit", "/exit", "/ping", "/ip", "/info", "/geo", "/send "}
+var knownCommands = []string{"/quit", "/exit", "/ping", "/ip", "/info", "/geo", "/send ", "/clear", "/help", "/ls"}
 
 func isKnownCommand(text string) bool {
 	for _, c := range knownCommands {
 		if strings.HasPrefix(c, "/send") {
-			// prefix match
 			if strings.HasPrefix(text, c) {
 				return true
 			}
@@ -40,7 +39,10 @@ func isKnownCommand(text string) bool {
 type model struct {
 	messages       []Message
 	inputRunes     []rune
-	cursor         int // rune index in inputRunes
+	cursor         int    // rune index in inputRunes
+	history        []string // sent messages/commands, oldest first
+	historyIdx     int    // index into history while browsing; -1 = not browsing
+	savedInput     []rune // input saved when history browsing starts
 	myName         string
 	peerName       string
 	send           SendFn
@@ -115,9 +117,10 @@ var (
 // NewChat creates and starts the Bubbletea chat program.
 func NewChat(myName, peerName string, send SendFn) *tea.Program {
 	m := model{
-		myName:   myName,
-		peerName: peerName,
-		send:     send,
+		myName:     myName,
+		peerName:   peerName,
+		send:       send,
+		historyIdx: -1,
 	}
 	return tea.NewProgram(m, tea.WithAltScreen())
 }
@@ -178,6 +181,35 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case tea.KeyEnd, tea.KeyCtrlE:
 			m.cursor = len(m.inputRunes)
 
+		// --- history navigation ---
+		case tea.KeyUp:
+			if len(m.history) == 0 {
+				break
+			}
+			if m.historyIdx == -1 {
+				// Start browsing: save current input
+				m.savedInput = append([]rune{}, m.inputRunes...)
+				m.historyIdx = len(m.history) - 1
+			} else if m.historyIdx > 0 {
+				m.historyIdx--
+			}
+			m.inputRunes = []rune(m.history[m.historyIdx])
+			m.cursor = len(m.inputRunes)
+
+		case tea.KeyDown:
+			if m.historyIdx == -1 {
+				break
+			}
+			if m.historyIdx < len(m.history)-1 {
+				m.historyIdx++
+				m.inputRunes = []rune(m.history[m.historyIdx])
+			} else {
+				// Back to current input
+				m.historyIdx = -1
+				m.inputRunes = append([]rune{}, m.savedInput...)
+			}
+			m.cursor = len(m.inputRunes)
+
 		// --- editing ---
 		case tea.KeyBackspace, tea.KeyDelete:
 			if msg.Type == tea.KeyDelete {
@@ -217,19 +249,49 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Quit
 			}
 
+			// /clear — wipe the message area locally, no network send.
+			if text == "/clear" {
+				m.messages = m.messages[:0]
+				return m, nil
+			}
+
+			// /help — show command list locally.
+			if text == "/help" {
+				help := []string{
+					"/ping          — measure round-trip time to peer",
+					"/ip  /info     — show your and peer's public address",
+					"/geo           — look up peer's location",
+					"/send <file>   — send a file to peer",
+					"/ls            — list files in current directory",
+					"/clear         — clear the chat window",
+					"/help          — show this help",
+					"/quit          — exit punch",
+				}
+				for _, line := range help {
+					m.messages = append(m.messages, Message{Body: line, At: time.Now()})
+				}
+				return m, nil
+			}
+
 			// Unknown slash command — show error, don't send.
 			if strings.HasPrefix(text, "/") && !isKnownCommand(text) {
 				m.messages = append(m.messages, Message{
-					From: "",
-					Body: fmt.Sprintf("unknown command: %s", text),
+					Body: fmt.Sprintf("unknown command: %s  (try /help)", text),
 					At:   time.Now(),
 				})
 				return m, nil
 			}
 
+			// Add to history (skip duplicates of last entry).
+			if len(m.history) == 0 || m.history[len(m.history)-1] != text {
+				m.history = append(m.history, text)
+			}
+			m.historyIdx = -1
+			m.savedInput = m.savedInput[:0]
+
 			// Known commands handled by cmd layer — don't echo locally.
 			isCmd := text == "/ping" || text == "/ip" || text == "/info" || text == "/geo" ||
-				strings.HasPrefix(text, "/send ")
+				strings.HasPrefix(text, "/send ") || text == "/ls"
 			if !isCmd {
 				m.messages = append(m.messages, Message{
 					From: m.myName,
@@ -288,7 +350,7 @@ func (m model) View() string {
 	}
 
 	headerLine := headerStyle.Render(
-		fmt.Sprintf("punch — %s ↔ %s   (/ping  /ip  /geo  /send <file>  /quit)", m.myName, m.peerName),
+		fmt.Sprintf("punch — %s ↔ %s   (/help for commands)", m.myName, m.peerName),
 	)
 
 	// Reserve lines for: header(1) + progress(0/1) + confirm(0/1) + input(3).
