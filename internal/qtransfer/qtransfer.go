@@ -21,6 +21,7 @@
 package qtransfer
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
@@ -30,10 +31,12 @@ import (
 	"encoding/pem"
 	"fmt"
 	"io"
+	"log"
 	"math/big"
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/quic-go/quic-go"
@@ -50,10 +53,33 @@ const (
 	udpBufSize = 7 << 20 // 7 MB
 )
 
+// suppressQuicLogs installs a one-time filter on the standard logger that
+// drops quic-go's UDP buffer-size warning. That warning fires when the OS
+// caps the socket buffer below quic-go's 7 MB recommendation — we've already
+// called SetReadBuffer/SetWriteBuffer; if the OS won't allow it there's nothing
+// more we can do at runtime, so the warning is just noise.
+var suppressOnce sync.Once
+
+func suppressQuicLogs() {
+	suppressOnce.Do(func() {
+		log.SetOutput(&quicLogFilter{w: log.Writer()})
+	})
+}
+
+// quicLogFilter wraps an io.Writer and drops lines that contain the
+// quic-go UDP buffer-size warning URL.
+type quicLogFilter struct{ w io.Writer }
+
+func (f *quicLogFilter) Write(p []byte) (int, error) {
+	if bytes.Contains(p, []byte("UDP-Buffer-Sizes")) {
+		return len(p), nil // silently discard
+	}
+	return f.w.Write(p)
+}
+
 // tuneBuffers tries to enlarge the UDP socket buffers before handing the conn
-// to quic-go. This suppresses quic-go's buffer-size warning on systems that
-// allow large buffers (macOS, tuned Linux). On restricted hosts the OS silently
-// caps the value — the warning may still appear but the transfer still works.
+// to quic-go. On systems where the OS allows it this prevents the warning
+// entirely; on restricted hosts suppressQuicLogs() catches the remainder.
 func tuneBuffers(conn net.PacketConn) {
 	if u, ok := conn.(*net.UDPConn); ok {
 		_ = u.SetReadBuffer(udpBufSize)
@@ -103,6 +129,7 @@ func ClientTLSConfig() *tls.Config {
 // conn must be a hole-punched UDP socket pointing toward remote.
 // progress is called with (bytesSent, totalBytes) after each write; may be nil.
 func Send(conn net.PacketConn, remote net.Addr, filePath string, progress func(int64, int64)) error {
+	suppressQuicLogs()
 	tuneBuffers(conn)
 
 	f, err := os.Open(filePath)
@@ -173,6 +200,7 @@ func Send(conn net.PacketConn, remote net.Addr, filePath string, progress func(i
 // conn must be a hole-punched UDP socket (the NAT hole must already be open).
 // progress is called with (bytesReceived, totalBytes); may be nil.
 func Receive(conn net.PacketConn, savePath string, progress func(int64, int64)) error {
+	suppressQuicLogs()
 	tuneBuffers(conn)
 
 	tlsConf, err := ServerTLSConfig()
