@@ -12,6 +12,7 @@ import (
 	"github.com/ashutoshsinghai/punch/internal/stun"
 	"github.com/ashutoshsinghai/punch/internal/token"
 	"github.com/spf13/cobra"
+	"golang.org/x/term"
 )
 
 var shareFormat string
@@ -59,8 +60,15 @@ func runShare(_ *cobra.Command, _ []string) error {
 	}
 
 	fmt.Printf("\nToken: %s\n", display)
-	if err := clipboard.WriteAll(display); err == nil {
-		fmt.Println("(copied to clipboard)")
+	fmt.Print("Press 'c' to copy to clipboard, any other key to skip: ")
+	if key := readSingleKey(); key == 'c' || key == 'C' {
+		if err := clipboard.WriteAll(display); err == nil {
+			fmt.Println("copied!")
+		} else {
+			fmt.Println("copy failed: " + err.Error())
+		}
+	} else {
+		fmt.Println()
 	}
 	fmt.Println("Send this to your peer over WhatsApp/Signal.\n")
 	fmt.Print("Peer's reply token: ")
@@ -95,4 +103,26 @@ func runShare(_ *cobra.Command, _ []string) error {
 
 	fmt.Fprintln(os.Stderr, "Connected. Direct P2P. No server.\n")
 	return runChat(result, payload.SessionHex(), myName, fmt.Sprintf("%s:%d", publicIP, publicPort))
+}
+
+// readSingleKey reads one keypress without requiring Enter.
+// Falls back to reading a full line if the terminal isn't a TTY.
+func readSingleKey() byte {
+	fd := int(os.Stdin.Fd())
+	if term.IsTerminal(fd) {
+		oldState, err := term.MakeRaw(fd)
+		if err == nil {
+			defer term.Restore(fd, oldState)
+			buf := make([]byte, 1)
+			os.Stdin.Read(buf) //nolint:errcheck
+			return buf[0]
+		}
+	}
+	// Fallback: read a line and return the first character.
+	reader := bufio.NewReader(os.Stdin)
+	line, _ := reader.ReadString('\n')
+	if len(strings.TrimSpace(line)) > 0 {
+		return line[0]
+	}
+	return 0
 }
