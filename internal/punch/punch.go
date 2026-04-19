@@ -176,9 +176,14 @@ func SoloPunch(conn *net.UDPConn, remote *net.UDPAddr) error {
 		if from.String() == remote.String() &&
 			n >= len(probeMsg) && string(buf[:len(probeMsg)]) == probeMsg {
 			conn.SetReadDeadline(time.Time{})
-			// Keep probing briefly so the peer can also exit their loop.
+			// Keep probing for 30 s so the peer can exit its own SoloPunch loop
+			// even after the caller has moved on to QUIC dial/listen.  Without
+			// this the peer only has ~2 s to receive a PUNCH packet before the
+			// goroutine stops and only QUIC packets arrive — which SoloPunch
+			// discards — leaving the peer stuck until timeout.
 			go func() {
-				for i := 0; i < 10; i++ {
+				deadline := time.Now().Add(30 * time.Second)
+				for time.Now().Before(deadline) {
 					conn.WriteToUDP(probe, remote) //nolint:errcheck
 					time.Sleep(probeInterval)
 				}
