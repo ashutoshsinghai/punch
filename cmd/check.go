@@ -9,6 +9,8 @@ import (
 	"github.com/spf13/cobra"
 )
 
+var checkPort int
+
 var checkCmd = &cobra.Command{
 	Use:   "check",
 	Short: "Check if your network supports direct P2P connections",
@@ -16,6 +18,7 @@ var checkCmd = &cobra.Command{
 }
 
 func init() {
+	checkCmd.Flags().IntVar(&checkPort, "port", 0, "Local UDP port to bind (0 = random, try 3478 if direct connection fails)")
 	rootCmd.AddCommand(checkCmd)
 }
 
@@ -25,7 +28,7 @@ func runCheck(_ *cobra.Command, _ []string) error {
 	// ── STUN ─────────────────────────────────────────────────────────────────
 	fmt.Fprintf(os.Stderr, "[   ] STUN\n")
 	fmt.Fprintf(os.Stderr, "      → querying %s...\n", stun.Server)
-	conn, err := punch.BindSocket()
+	conn, err := punch.BindSocket(checkPort)
 	if err != nil {
 		return stepFail("STUN", err.Error())
 	}

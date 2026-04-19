@@ -15,6 +15,7 @@ import (
 )
 
 var shareFormat string
+var sharePort int
 
 var shareCmd = &cobra.Command{
 	Use:   "share",
@@ -24,6 +25,7 @@ var shareCmd = &cobra.Command{
 
 func init() {
 	shareCmd.Flags().StringVar(&shareFormat, "token", "words", "Token format: words | base58")
+	shareCmd.Flags().IntVar(&sharePort, "port", 0, "Local UDP port to bind (0 = random, try 3478 if direct connection fails)")
 	rootCmd.AddCommand(shareCmd)
 }
 
@@ -33,7 +35,7 @@ func runShare(_ *cobra.Command, _ []string) error {
 	// ── Step 1: STUN ──────────────────────────────────────────────────────────
 	fmt.Fprintf(os.Stderr, "[   ] STUN\n")
 	fmt.Fprintf(os.Stderr, "      → querying %s...\n", stun.Server)
-	conn, err := punch.BindSocket()
+	conn, err := punch.BindSocket(sharePort)
 	if err != nil {
 		return stepFail("STUN", err.Error())
 	}

@@ -246,7 +246,7 @@ func chatSendFile(path string, chatConn *transport.Conn, cipher *crypto.Cipher, 
 
 	// Bind a dedicated UDP socket for the file transfer and discover its
 	// public address via STUN so the peer can punch back to us.
-	ftConn, err := punch.BindSocket()
+	ftConn, err := punch.BindSocket(0)
 	if err != nil {
 		prog.Send(ui.SystemMsg{Text: "send error (bind FT socket): " + err.Error()})
 		return
@@ -390,7 +390,7 @@ func handleIncomingFileOffer(offer string, chatConn *transport.Conn, cipher *cry
 	}
 
 	// Bind a dedicated FT socket and discover our public FT port.
-	ftConn, err := punch.BindSocket()
+	ftConn, err := punch.BindSocket(0)
 	if err != nil {
 		prog.Send(ui.SystemMsg{Text: "FT accept error (bind): " + err.Error()})
 		sendChatSignal(chatConn, cipher, "FILE_DECLINE")
@@ -464,7 +464,7 @@ func chatQSendFile(path string, chatConn *transport.Conn, cipher *crypto.Cipher,
 	name := filepath.Base(path)
 	total := info.Size()
 
-	ftConn, err := punch.BindSocket()
+	ftConn, err := punch.BindSocket(0)
 	if err != nil {
 		prog.Send(ui.SystemMsg{Text: "qsend error (bind FT socket): " + err.Error()})
 		return
@@ -598,7 +598,7 @@ func handleIncomingQFileOffer(offer string, chatConn *transport.Conn, cipher *cr
 		return
 	}
 
-	ftConn, err := punch.BindSocket()
+	ftConn, err := punch.BindSocket(0)
 	if err != nil {
 		prog.Send(ui.SystemMsg{Text: "QUIC accept error (bind): " + err.Error()})
 		sendChatSignal(chatConn, cipher, "QFILE_DECLINE")

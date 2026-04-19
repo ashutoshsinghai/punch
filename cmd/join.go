@@ -11,6 +11,8 @@ import (
 	"github.com/spf13/cobra"
 )
 
+var joinPort int
+
 var joinCmd = &cobra.Command{
 	Use:   "join <token>",
 	Short: "Connect to a peer using their token",
@@ -19,6 +21,7 @@ var joinCmd = &cobra.Command{
 }
 
 func init() {
+	joinCmd.Flags().IntVar(&joinPort, "port", 0, "Local UDP port to bind (0 = random, try 3478 if direct connection fails)")
 	rootCmd.AddCommand(joinCmd)
 }
 
@@ -39,7 +42,7 @@ func runJoin(_ *cobra.Command, args []string) error {
 	// ── Step 2: STUN ──────────────────────────────────────────────────────────
 	fmt.Fprintf(os.Stderr, "[   ] STUN\n")
 	fmt.Fprintf(os.Stderr, "      → querying %s...\n", stun.Server)
-	conn, err := punch.BindSocket()
+	conn, err := punch.BindSocket(joinPort)
 	if err != nil {
 		return stepFail("STUN", err.Error())
 	}

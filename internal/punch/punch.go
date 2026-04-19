@@ -274,12 +274,13 @@ func DialRaw(remoteIP string, remotePort uint16) (*net.UDPConn, *net.UDPAddr, er
 	return nil, nil, fmt.Errorf("no response from %s:%d within %s", remoteIP, remotePort, probeTimeout)
 }
 
-// BindSocket creates a new UDP socket on a random available port and
-// returns it ready for use (STUN discovery, hole punching, etc.).
-func BindSocket() (*net.UDPConn, error) {
-	conn, err := net.ListenUDP("udp4", &net.UDPAddr{Port: 0})
+// BindSocket creates a UDP socket on the given port and returns it ready
+// for use (STUN discovery, hole punching, etc.).
+// Pass port 0 to let the OS pick a random available port.
+func BindSocket(port int) (*net.UDPConn, error) {
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{Port: port})
 	if err != nil {
-		return nil, fmt.Errorf("failed to bind UDP socket: %w", err)
+		return nil, fmt.Errorf("failed to bind UDP socket on port %d: %w", port, err)
 	}
 	return conn, nil
 }
