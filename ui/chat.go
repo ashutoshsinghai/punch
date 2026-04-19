@@ -19,12 +19,12 @@ type Message struct {
 // SendFn is called by the UI when the user submits a message.
 type SendFn func(msg string) error
 
-// knownCommands is the set of recognised slash-commands (prefix match for /send and /qsend).
-var knownCommands = []string{"/quit", "/exit", "/ping", "/ip", "/info", "/geo", "/send ", "/qsend ", "/clear", "/help", "/ls"}
+// knownCommands is the set of recognised slash-commands (prefix match for /send, /qsend and /rename).
+var knownCommands = []string{"/quit", "/exit", "/ping", "/ip", "/info", "/geo", "/send ", "/qsend ", "/rename ", "/clear", "/help", "/ls"}
 
 func isKnownCommand(text string) bool {
 	for _, c := range knownCommands {
-		if strings.HasPrefix(c, "/send") || strings.HasPrefix(c, "/qsend") {
+		if strings.HasSuffix(c, " ") { // prefix-match commands that take arguments
 			if strings.HasPrefix(text, c) {
 				return true
 			}
@@ -77,6 +77,12 @@ type ConfirmMsg struct {
 
 // ErrMsg signals a fatal error.
 type ErrMsg struct{ Err error }
+
+// RenameMsg updates the local user's display name mid-session.
+type RenameMsg struct{ Name string }
+
+// PeerRenameMsg updates the peer's display name when they use /rename.
+type PeerRenameMsg struct{ Name string }
 
 var (
 	headerStyle = lipgloss.NewStyle().
@@ -263,6 +269,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					"/geo           — look up peer's location",
 					"/send <file>   — send a file to peer (custom ARQ)",
 				"/qsend <file>  — send a file via QUIC (benchmark)",
+				"/rename <name> — change your display name for this session",
 					"/ls            — list files in current directory",
 					"/clear         — clear the chat window",
 					"/help          — show this help",
@@ -292,7 +299,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			// Known commands handled by cmd layer — don't echo locally.
 			isCmd := text == "/ping" || text == "/ip" || text == "/info" || text == "/geo" ||
-				strings.HasPrefix(text, "/send ") || strings.HasPrefix(text, "/qsend ") || text == "/ls"
+				strings.HasPrefix(text, "/send ") || strings.HasPrefix(text, "/qsend ") ||
+				strings.HasPrefix(text, "/rename ") || text == "/ls"
 			if !isCmd {
 				m.messages = append(m.messages, Message{
 					From: m.myName,
@@ -340,6 +348,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case ErrMsg:
 		m.err = msg.Err
+
+	case RenameMsg:
+		m.myName = msg.Name
+		m.messages = append(m.messages, Message{Body: "you are now known as " + msg.Name, At: time.Now()})
+
+	case PeerRenameMsg:
+		m.messages = append(m.messages, Message{Body: m.peerName + " renamed to " + msg.Name, At: time.Now()})
+		m.peerName = msg.Name
 	}
 
 	return m, nil

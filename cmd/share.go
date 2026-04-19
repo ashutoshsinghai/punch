@@ -27,7 +27,6 @@ func init() {
 }
 
 func runShare(_ *cobra.Command, _ []string) error {
-	myName := promptName()
 	fmt.Fprintln(os.Stderr)
 
 	// ── Step 1: STUN ──────────────────────────────────────────────────────────
@@ -73,6 +72,17 @@ func runShare(_ *cobra.Command, _ []string) error {
 	} else {
 		fmt.Fprintf(os.Stderr, "      → both servers see the same port — NAT is not symmetric\n")
 		stepOK("NAT type", "port-restricted, hole punching should work")
+	}
+
+	// ── Verdict ───────────────────────────────────────────────────────────────
+	fmt.Fprintf(os.Stderr, "[   ] verdict\n")
+	if diag.IsCGNAT || diag.IsSymmetric {
+		fmt.Fprintf(os.Stderr, "      → your network will likely block hole punching\n")
+		fmt.Fprintf(os.Stderr, "      → proceeding anyway — switch to a mobile hotspot if it fails\n")
+		stepWarn("verdict", "likely to fail on your side")
+	} else {
+		fmt.Fprintf(os.Stderr, "      → your network supports direct P2P connections\n")
+		stepOK("verdict", "your side is ready")
 	}
 
 	// ── Step 3: Token exchange ────────────────────────────────────────────────
@@ -127,7 +137,7 @@ func runShare(_ *cobra.Command, _ []string) error {
 	stepOK("hole punch", "connected — direct P2P, no server")
 
 	fmt.Fprintln(os.Stderr)
-	return runChat(result, payload.SessionHex(), myName, fmt.Sprintf("%s:%d", publicIP, publicPort))
+	return runChat(result, payload.SessionHex(), "", fmt.Sprintf("%s:%d", publicIP, publicPort))
 }
 
 // ── Step output helpers ───────────────────────────────────────────────────────

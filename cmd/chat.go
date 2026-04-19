@@ -1,14 +1,12 @@
 package cmd
 
 import (
-	"bufio"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"os"
-	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -16,6 +14,7 @@ import (
 
 	"github.com/ashutoshsinghai/punch/internal/crypto"
 	"github.com/ashutoshsinghai/punch/internal/filetransfer"
+	"github.com/ashutoshsinghai/punch/internal/names"
 	"github.com/ashutoshsinghai/punch/internal/punch"
 	"github.com/ashutoshsinghai/punch/internal/qtransfer"
 	"github.com/ashutoshsinghai/punch/internal/stun"
@@ -25,6 +24,10 @@ import (
 )
 
 func runChat(result *punch.Result, session, myName, myPublicAddr string) error {
+	// If no name was provided, generate a fresh random one for this session.
+	if myName == "" {
+		myName = names.Random()
+	}
 	cipher, err := crypto.NewCipher(session)
 	if err != nil {
 		return err
@@ -76,6 +79,17 @@ func runChat(result *punch.Result, session, myName, myPublicAddr string) error {
 		case strings.HasPrefix(msg, "/qsend "):
 			path := strings.TrimSpace(strings.TrimPrefix(msg, "/qsend "))
 			go chatQSendFile(path, result.Conn, cipher, prog, qftAcceptCh, peerName, result.Remote.IP.String())
+			return nil
+
+		case strings.HasPrefix(msg, "/rename "):
+			newName := strings.TrimSpace(strings.TrimPrefix(msg, "/rename "))
+			if newName == "" {
+				prog.Send(ui.SystemMsg{Text: "usage: /rename <name>"})
+				return nil
+			}
+			myName = newName
+			prog.Send(ui.RenameMsg{Name: newName})
+			go sendChatSignal(result.Conn, cipher, "__RENAME__:"+newName)
 			return nil
 
 		case msg == "/ls":
@@ -190,6 +204,13 @@ func runChat(result *punch.Result, session, myName, myPublicAddr string) error {
 				select {
 				case qftAcceptCh <- -1:
 				default:
+				}
+
+			case strings.HasPrefix(text, "__RENAME__:"):
+				newName := strings.TrimPrefix(text, "__RENAME__:")
+				if newName != "" {
+					peerName = newName
+					prog.Send(ui.PeerRenameMsg{Name: newName})
 				}
 
 			case text == "__BYE__":
@@ -689,17 +710,6 @@ func exchangeNames(conn *transport.Conn, cipher *crypto.Cipher, myName string) s
 }
 
 // promptName asks the user for their display name, falling back to the OS username.
-func promptName() string {
-	fmt.Print("Your name: ")
-	reader := bufio.NewReader(os.Stdin)
-	name, _ := reader.ReadString('\n')
-	name = strings.TrimSpace(name)
-	if name == "" {
-		return localUsername()
-	}
-	return name
-}
-
 // lookupGeo calls ip-api.com (opt-in, triggered by /geo) to show peer location.
 func lookupGeo(ip, peerName string, prog *tea.Program) {
 	prog.Send(ui.SystemMsg{Text: fmt.Sprintf("looking up %s...", ip)})
@@ -763,13 +773,3 @@ func progressBar(pct int) string {
 	return string(bar)
 }
 
-func localUsername() string {
-	u, err := user.Current()
-	if err != nil {
-		return "me"
-	}
-	if u.Username != "" {
-		return u.Username
-	}
-	return "me"
-}

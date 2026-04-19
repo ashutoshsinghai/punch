@@ -23,7 +23,6 @@ func init() {
 }
 
 func runJoin(_ *cobra.Command, args []string) error {
-	myName := promptName()
 	fmt.Fprintln(os.Stderr)
 
 	// ── Step 1: Decode peer's token ───────────────────────────────────────────
@@ -82,6 +81,17 @@ func runJoin(_ *cobra.Command, args []string) error {
 		stepOK("NAT type", "port-restricted, hole punching should work")
 	}
 
+	// ── Verdict ───────────────────────────────────────────────────────────────
+	fmt.Fprintf(os.Stderr, "[   ] verdict\n")
+	if diag.IsCGNAT || diag.IsSymmetric {
+		fmt.Fprintf(os.Stderr, "      → your network will likely block hole punching\n")
+		fmt.Fprintf(os.Stderr, "      → proceeding anyway — switch to a mobile hotspot if it fails\n")
+		stepWarn("verdict", "likely to fail on your side")
+	} else {
+		fmt.Fprintf(os.Stderr, "      → your network supports direct P2P connections\n")
+		stepOK("verdict", "your side is ready")
+	}
+
 	// ── Step 4: Reply token ───────────────────────────────────────────────────
 	replyPayload, err := token.NewReplyPayload(myPublicIP, myPublicPort, payload.Session)
 	if err != nil {
@@ -112,5 +122,5 @@ func runJoin(_ *cobra.Command, args []string) error {
 	stepOK("hole punch", "connected — direct P2P, no server")
 
 	fmt.Fprintln(os.Stderr)
-	return runChat(result, payload.SessionHex(), myName, fmt.Sprintf("%s:%d", myPublicIP, myPublicPort))
+	return runChat(result, payload.SessionHex(), "", fmt.Sprintf("%s:%d", myPublicIP, myPublicPort))
 }
