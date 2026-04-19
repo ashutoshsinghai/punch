@@ -30,9 +30,11 @@ func init() {
 
 func runShare(_ *cobra.Command, _ []string) error {
 	myName := promptName()
+	fmt.Fprintln(os.Stderr)
 
 	// ── Step 1: STUN ──────────────────────────────────────────────────────────
-	step("STUN", "discovering your public address...")
+	fmt.Fprintf(os.Stderr, "[   ] STUN\n")
+	fmt.Fprintf(os.Stderr, "      → querying %s...\n", stun.Server)
 	conn, err := punch.BindSocket()
 	if err != nil {
 		return stepFail("STUN", err.Error())
@@ -42,14 +44,37 @@ func runShare(_ *cobra.Command, _ []string) error {
 		return stepFail("STUN", err.Error())
 	}
 	publicIP, publicPort := diag.PublicIP, diag.PublicPort
-	stepOK("STUN", fmt.Sprintf("your address is %s:%d", publicIP, publicPort))
+	fmt.Fprintf(os.Stderr, "      → your public address: %s:%d\n", publicIP, publicPort)
+	fmt.Fprintf(os.Stderr, "        (this is what the internet sees for your UDP socket)\n")
+	stepOK("STUN", "")
 
 	// ── Step 2: NAT type ──────────────────────────────────────────────────────
-	natLabel, natWarn := natDiagLine(diag)
-	if natWarn {
-		stepWarn("NAT type", natLabel)
+	fmt.Fprintf(os.Stderr, "[   ] NAT type\n")
+	fmt.Fprintf(os.Stderr, "      → server 1 (%s)  mapped port: %d\n", stun.Server, diag.PublicPort)
+	if diag.PublicPort2 != 0 {
+		sameOrDiff := "same ✓"
+		if diag.IsSymmetric {
+			sameOrDiff = "DIFFERENT ✗"
+		}
+		fmt.Fprintf(os.Stderr, "      → server 2 (%s) mapped port: %d  (%s)\n",
+			stun.Server2, diag.PublicPort2, sameOrDiff)
 	} else {
-		stepOK("NAT type", natLabel)
+		fmt.Fprintf(os.Stderr, "      → server 2 query failed (skipping symmetric NAT check)\n")
+	}
+	if diag.IsCGNAT {
+		fmt.Fprintf(os.Stderr, "      → %s is in the CGNAT range (RFC 6598: 100.64.0.0/10)\n", publicIP)
+		fmt.Fprintf(os.Stderr, "        your ISP has put you behind their own NAT — two NATs between you and the internet\n")
+		fmt.Fprintf(os.Stderr, "        UDP hole punching cannot reliably work through double NAT\n")
+		fmt.Fprintf(os.Stderr, "        tip: switch to a mobile hotspot\n")
+		stepWarn("NAT type", "CGNAT detected")
+	} else if diag.IsSymmetric {
+		fmt.Fprintf(os.Stderr, "      → your router assigns a different external port per destination\n")
+		fmt.Fprintf(os.Stderr, "        the peer cannot predict which port to send packets back to\n")
+		fmt.Fprintf(os.Stderr, "        tip: switch to a mobile hotspot or set router NAT mode to Full Cone\n")
+		stepWarn("NAT type", "symmetric NAT detected")
+	} else {
+		fmt.Fprintf(os.Stderr, "      → both servers see the same port — NAT is not symmetric\n")
+		stepOK("NAT type", "port-restricted, hole punching should work")
 	}
 
 	// ── Step 3: Token exchange ────────────────────────────────────────────────
@@ -84,20 +109,22 @@ func runShare(_ *cobra.Command, _ []string) error {
 	if replyPayload.Session != payload.Session {
 		return stepFail("token", "session mismatch — make sure your peer used your token")
 	}
+	fmt.Fprintf(os.Stderr, "\n[   ] peer address\n")
+	fmt.Fprintf(os.Stderr, "      → decoded from reply token: %s:%d\n", replyPayload.IP, replyPayload.Port)
 	stepOK("peer address", fmt.Sprintf("%s:%d", replyPayload.IP, replyPayload.Port))
 
 	// ── Step 4: Hole punch ────────────────────────────────────────────────────
 	remote := &net.UDPAddr{IP: net.ParseIP(replyPayload.IP), Port: int(replyPayload.Port)}
-	step("hole punch", "probing peer...")
+	fmt.Fprintf(os.Stderr, "[   ] hole punch\n")
+	fmt.Fprintf(os.Stderr, "      → sending UDP probes to %s:%d every 200ms\n", replyPayload.IP, replyPayload.Port)
 
-	elapsed := 0
 	result, err := punch.Simultaneous(conn, remote, func(msg string) {
-		elapsed++
-		fmt.Fprintf(os.Stderr, "\r[   ] hole punch    — %s        ", msg)
+		fmt.Fprintf(os.Stderr, "\r      → %s        ", msg)
 	})
 	fmt.Fprintln(os.Stderr)
 	if err != nil {
-		return stepFail("hole punch", punchReason(diag))
+		printPunchFailReason(diag)
+		return stepFail("hole punch", "timed out — see diagnosis above")
 	}
 	stepOK("hole punch", "connected — direct P2P, no server")
 
@@ -107,55 +134,48 @@ func runShare(_ *cobra.Command, _ []string) error {
 
 // ── Step output helpers ───────────────────────────────────────────────────────
 
-func step(label, msg string) {
-	fmt.Fprintf(os.Stderr, "[   ] %-12s— %s\n", label, msg)
-}
-
 func stepOK(label, msg string) {
-	fmt.Fprintf(os.Stderr, "[ ✓ ] %-12s— %s\n", label, msg)
-}
-
-func stepWarn(label, msg string) {
-	fmt.Fprintf(os.Stderr, "[ ! ] %-12s— %s\n", label, msg)
-}
-
-func stepFail(label, msg string) error {
-	fmt.Fprintf(os.Stderr, "[ ✗ ] %-12s— %s\n", label, msg)
-	return fmt.Errorf("%s: %s", label, msg)
-}
-
-// natDiagLine returns a one-line description of the NAT type and whether
-// it should be shown as a warning.
-func natDiagLine(diag *stun.NATDiag) (line string, warn bool) {
-	switch {
-	case diag.IsCGNAT:
-		return fmt.Sprintf(
-			"CGNAT — %s is a shared ISP address, hole punching will likely fail\n"+
-				"              try switching to a mobile hotspot",
-			diag.PublicIP), true
-	case diag.IsSymmetric:
-		return "symmetric NAT — router assigns a different port per destination, hole punching may fail\n" +
-			"              try switching to a mobile hotspot or changing router NAT mode to Full Cone", true
-	default:
-		return "port-restricted NAT — hole punching should work", false
+	if msg != "" {
+		fmt.Fprintf(os.Stderr, "[ ✓ ] %s — %s\n", label, msg)
+	} else {
+		fmt.Fprintf(os.Stderr, "[ ✓ ] %s\n", label)
 	}
 }
 
-// punchReason returns a plain string explaining why the punch likely failed,
-// based on the local NAT diagnostic.
-func punchReason(diag *stun.NATDiag) string {
+func stepWarn(label, msg string) {
+	fmt.Fprintf(os.Stderr, "[ ! ] %s — %s\n", label, msg)
+}
+
+func stepFail(label, msg string) error {
+	fmt.Fprintf(os.Stderr, "[ ✗ ] %s — %s\n", label, msg)
+	return fmt.Errorf("%s failed", label)
+}
+
+// printPunchFailReason prints a detailed diagnosis block when hole punching
+// times out, so the user (or the person they share it with) can pinpoint the cause.
+func printPunchFailReason(diag *stun.NATDiag) {
+	fmt.Fprintln(os.Stderr, "      → diagnosis:")
 	switch {
 	case diag.IsCGNAT:
-		return fmt.Sprintf(
-			"timed out — your ISP is using CGNAT (%s is not a true public IP)\n"+
-				"              fix: switch to a mobile hotspot, or ask your ISP for a public IP",
+		fmt.Fprintf(os.Stderr,
+			"        your ISP is using CGNAT — %s is not a true public IP\n"+
+				"        packets punched to this address never reach your router\n"+
+				"        fix: switch to a mobile hotspot (usually gets a real public IP)\n"+
+				"             or call your ISP and ask for a static/public IP\n",
 			diag.PublicIP)
 	case diag.IsSymmetric:
-		return "timed out — your router uses symmetric NAT\n" +
-			"              fix: switch to a mobile hotspot, or set router NAT mode to Full Cone"
+		fmt.Fprintf(os.Stderr,
+			"        your router uses symmetric NAT\n"+
+				"        server 1 saw port %d, server 2 saw port %d — they differ\n"+
+				"        the peer aimed at port %d but your router used a different port\n"+
+				"        fix: switch to a mobile hotspot\n"+
+				"             or change your router's NAT type to Full Cone / Endpoint-Independent\n",
+			diag.PublicPort, diag.PublicPort2, diag.PublicPort)
 	default:
-		return "timed out — your NAT looks OK, so the peer's network is likely the problem\n" +
-			"              ask your peer to paste their full output so you can see their NAT status"
+		fmt.Fprintln(os.Stderr,
+			"        your NAT looks fine (port-restricted, not symmetric, not CGNAT)\n"+
+				"        the peer's network is likely the problem\n"+
+				"        ask your peer to paste their full output — look at their NAT type lines")
 	}
 }
 

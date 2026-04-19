@@ -19,18 +19,19 @@ import (
 // Server is the default public STUN server used for discovery.
 const Server = "stun.l.google.com:19302"
 
-// server2 is a second STUN server with a different IP, used for symmetric
+// Server2 is a second STUN server with a different IP, used for symmetric
 // NAT detection. Querying two different destination IPs from the same local
 // socket and comparing the resulting mapped ports reveals whether the NAT
 // is symmetric (different port per destination) or not.
-const server2 = "stun3.l.google.com:19302"
+const Server2 = "stun3.l.google.com:19302"
 
 // NATDiag holds the result of a two-server NAT diagnostic.
 type NATDiag struct {
 	PublicIP    string
-	PublicPort  uint16
-	IsCGNAT     bool // public IP is in RFC 6598 (100.64.0.0/10) — ISP-level NAT
-	IsSymmetric bool // different mapped port observed per destination
+	PublicPort  uint16 // mapped port as seen by server 1
+	PublicPort2 uint16 // mapped port as seen by server 2 (0 if second query failed)
+	IsCGNAT     bool   // public IP is in RFC 6598 (100.64.0.0/10) — ISP-level NAT
+	IsSymmetric bool   // different mapped port observed per destination
 }
 
 // CheckNAT performs two STUN queries from conn to two different servers and
@@ -52,8 +53,9 @@ func CheckNAT(conn *net.UDPConn) (*NATDiag, error) {
 	}
 
 	// Second query — different destination IP reveals symmetric NAT.
-	_, port2, err := DiscoverFrom(conn, server2)
+	_, port2, err := DiscoverFrom(conn, Server2)
 	if err == nil {
+		diag.PublicPort2 = port2
 		diag.IsSymmetric = port1 != port2
 	}
 

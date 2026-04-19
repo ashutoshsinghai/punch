@@ -24,17 +24,22 @@ func init() {
 
 func runJoin(_ *cobra.Command, args []string) error {
 	myName := promptName()
+	fmt.Fprintln(os.Stderr)
 
 	// ── Step 1: Decode peer's token ───────────────────────────────────────────
 	rawToken := args[0]
+	fmt.Fprintf(os.Stderr, "[   ] peer address\n")
+	fmt.Fprintf(os.Stderr, "      → decoding token...\n")
 	payload, err := token.Decode(rawToken)
 	if err != nil {
-		return stepFail("token", "invalid token — "+err.Error())
+		return stepFail("peer address", "invalid token — "+err.Error())
 	}
+	fmt.Fprintf(os.Stderr, "      → peer's public address: %s:%d\n", payload.IP, payload.Port)
 	stepOK("peer address", fmt.Sprintf("%s:%d", payload.IP, payload.Port))
 
 	// ── Step 2: STUN ──────────────────────────────────────────────────────────
-	step("STUN", "discovering your public address...")
+	fmt.Fprintf(os.Stderr, "[   ] STUN\n")
+	fmt.Fprintf(os.Stderr, "      → querying %s...\n", stun.Server)
 	conn, err := punch.BindSocket()
 	if err != nil {
 		return stepFail("STUN", err.Error())
@@ -44,14 +49,37 @@ func runJoin(_ *cobra.Command, args []string) error {
 		return stepFail("STUN", err.Error())
 	}
 	myPublicIP, myPublicPort := diag.PublicIP, diag.PublicPort
-	stepOK("STUN", fmt.Sprintf("your address is %s:%d", myPublicIP, myPublicPort))
+	fmt.Fprintf(os.Stderr, "      → your public address: %s:%d\n", myPublicIP, myPublicPort)
+	fmt.Fprintf(os.Stderr, "        (this is what the internet sees for your UDP socket)\n")
+	stepOK("STUN", "")
 
 	// ── Step 3: NAT type ──────────────────────────────────────────────────────
-	natLabel, natWarn := natDiagLine(diag)
-	if natWarn {
-		stepWarn("NAT type", natLabel)
+	fmt.Fprintf(os.Stderr, "[   ] NAT type\n")
+	fmt.Fprintf(os.Stderr, "      → server 1 (%s)  mapped port: %d\n", stun.Server, diag.PublicPort)
+	if diag.PublicPort2 != 0 {
+		sameOrDiff := "same ✓"
+		if diag.IsSymmetric {
+			sameOrDiff = "DIFFERENT ✗"
+		}
+		fmt.Fprintf(os.Stderr, "      → server 2 (%s) mapped port: %d  (%s)\n",
+			stun.Server2, diag.PublicPort2, sameOrDiff)
 	} else {
-		stepOK("NAT type", natLabel)
+		fmt.Fprintf(os.Stderr, "      → server 2 query failed (skipping symmetric NAT check)\n")
+	}
+	if diag.IsCGNAT {
+		fmt.Fprintf(os.Stderr, "      → %s is in the CGNAT range (RFC 6598: 100.64.0.0/10)\n", myPublicIP)
+		fmt.Fprintf(os.Stderr, "        your ISP has put you behind their own NAT — two NATs between you and the internet\n")
+		fmt.Fprintf(os.Stderr, "        UDP hole punching cannot reliably work through double NAT\n")
+		fmt.Fprintf(os.Stderr, "        tip: switch to a mobile hotspot\n")
+		stepWarn("NAT type", "CGNAT detected")
+	} else if diag.IsSymmetric {
+		fmt.Fprintf(os.Stderr, "      → your router assigns a different external port per destination\n")
+		fmt.Fprintf(os.Stderr, "        the peer cannot predict which port to send packets back to\n")
+		fmt.Fprintf(os.Stderr, "        tip: switch to a mobile hotspot or set router NAT mode to Full Cone\n")
+		stepWarn("NAT type", "symmetric NAT detected")
+	} else {
+		fmt.Fprintf(os.Stderr, "      → both servers see the same port — NAT is not symmetric\n")
+		stepOK("NAT type", "port-restricted, hole punching should work")
 	}
 
 	// ── Step 4: Reply token ───────────────────────────────────────────────────
@@ -70,14 +98,16 @@ func runJoin(_ *cobra.Command, args []string) error {
 
 	// ── Step 5: Hole punch ────────────────────────────────────────────────────
 	remote := &net.UDPAddr{IP: net.ParseIP(payload.IP), Port: int(payload.Port)}
-	step("hole punch", "probing peer...")
+	fmt.Fprintf(os.Stderr, "\n[   ] hole punch\n")
+	fmt.Fprintf(os.Stderr, "      → sending UDP probes to %s:%d every 200ms\n", payload.IP, payload.Port)
 
 	result, err := punch.Simultaneous(conn, remote, func(msg string) {
-		fmt.Fprintf(os.Stderr, "\r[   ] hole punch    — %s        ", msg)
+		fmt.Fprintf(os.Stderr, "\r      → %s        ", msg)
 	})
 	fmt.Fprintln(os.Stderr)
 	if err != nil {
-		return stepFail("hole punch", punchReason(diag))
+		printPunchFailReason(diag)
+		return stepFail("hole punch", "timed out — see diagnosis above")
 	}
 	stepOK("hole punch", "connected — direct P2P, no server")
 
