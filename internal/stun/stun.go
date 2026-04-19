@@ -19,6 +19,67 @@ import (
 // Server is the default public STUN server used for discovery.
 const Server = "stun.l.google.com:19302"
 
+// server2 is a second STUN server with a different IP, used for symmetric
+// NAT detection. Querying two different destination IPs from the same local
+// socket and comparing the resulting mapped ports reveals whether the NAT
+// is symmetric (different port per destination) or not.
+const server2 = "stun3.l.google.com:19302"
+
+// NATDiag holds the result of a two-server NAT diagnostic.
+type NATDiag struct {
+	PublicIP    string
+	PublicPort  uint16
+	IsCGNAT     bool // public IP is in RFC 6598 (100.64.0.0/10) — ISP-level NAT
+	IsSymmetric bool // different mapped port observed per destination
+}
+
+// CheckNAT performs two STUN queries from conn to two different servers and
+// returns a NAT diagnostic. It replaces a plain Discover call: the returned
+// PublicIP/PublicPort are what should go into the token.
+//
+// Failure of the second STUN query is non-fatal — IsSymmetric is left false
+// so the caller doesn't raise a false alarm.
+func CheckNAT(conn *net.UDPConn) (*NATDiag, error) {
+	ip1, port1, err := DiscoverFrom(conn, Server)
+	if err != nil {
+		return nil, err
+	}
+
+	diag := &NATDiag{
+		PublicIP:   ip1,
+		PublicPort: port1,
+		IsCGNAT:    isCGNATorPrivate(ip1),
+	}
+
+	// Second query — different destination IP reveals symmetric NAT.
+	_, port2, err := DiscoverFrom(conn, server2)
+	if err == nil {
+		diag.IsSymmetric = port1 != port2
+	}
+
+	return diag, nil
+}
+
+// isCGNATorPrivate returns true if ip is in a range that indicates the STUN
+// server is seeing an ISP NAT address rather than a true public IP.
+func isCGNATorPrivate(ipStr string) bool {
+	ip := net.ParseIP(ipStr).To4()
+	if ip == nil {
+		return false
+	}
+	switch {
+	case ip[0] == 100 && ip[1] >= 64 && ip[1] <= 127: // RFC 6598 CGNAT
+		return true
+	case ip[0] == 10: // RFC 1918
+		return true
+	case ip[0] == 172 && ip[1] >= 16 && ip[1] <= 31: // RFC 1918
+		return true
+	case ip[0] == 192 && ip[1] == 168: // RFC 1918
+		return true
+	}
+	return false
+}
+
 const (
 	msgBindingRequest  = 0x0001
 	msgBindingResponse = 0x0101
@@ -28,15 +89,21 @@ const (
 	attrMappedAddr    = 0x0001
 )
 
-// Discover sends a STUN Binding Request from conn and returns the
-// public IP and port as observed by the STUN server.
+// Discover sends a STUN Binding Request from conn to the default server and
+// returns the public IP and port as observed by the STUN server.
 //
 // conn must already be bound (e.g. via net.ListenUDP). It is NOT
 // closed — the caller continues to use it for hole punching.
 func Discover(conn *net.UDPConn) (ip string, port uint16, err error) {
-	serverAddr, err := net.ResolveUDPAddr("udp4", Server)
+	return DiscoverFrom(conn, Server)
+}
+
+// DiscoverFrom sends a STUN Binding Request from conn to the given server
+// (host:port) and returns the public IP and port the server observed.
+func DiscoverFrom(conn *net.UDPConn, server string) (ip string, port uint16, err error) {
+	serverAddr, err := net.ResolveUDPAddr("udp4", server)
 	if err != nil {
-		return "", 0, fmt.Errorf("resolve STUN server: %w", err)
+		return "", 0, fmt.Errorf("resolve STUN server %s: %w", server, err)
 	}
 
 	// Build a 20-byte STUN Binding Request header (no attributes).

@@ -39,12 +39,14 @@ func runJoin(_ *cobra.Command, args []string) error {
 		return err
 	}
 
-	myPublicIP, myPublicPort, err := stun.Discover(conn)
+	diag, err := stun.CheckNAT(conn)
 	if err != nil {
 		return fmt.Errorf("STUN discovery failed: %w", err)
 	}
+	myPublicIP, myPublicPort := diag.PublicIP, diag.PublicPort
 	fmt.Fprintf(os.Stderr, "Your public address: %s:%d\n", myPublicIP, myPublicPort)
 	fmt.Fprintf(os.Stderr, "Peer's public address: %s:%d\n", payload.IP, payload.Port)
+	printNATDiag(diag)
 
 	replyPayload, err := token.NewReplyPayload(myPublicIP, myPublicPort, payload.Session)
 	if err != nil {
@@ -60,18 +62,21 @@ func runJoin(_ *cobra.Command, args []string) error {
 	fmt.Printf("\nReply token: %s\n", replyWords)
 	offerClipboard(replyWords)
 	fmt.Println("Send this back to your peer over WhatsApp/Signal.")
-	fmt.Fprintln(os.Stderr, "\nPunching through NAT (keeping hole open while peer confirms)...")
+	fmt.Fprintln(os.Stderr, "\nPunching through NAT...")
 
 	remote := &net.UDPAddr{
 		IP:   net.ParseIP(payload.IP),
 		Port: int(payload.Port),
 	}
 
-	// Simultaneous starts probing Alice immediately — this keeps Bob's NAT hole
-	// open while Alice reads the reply token and enters it.
-	result, err := punch.Simultaneous(conn, remote)
+	// Simultaneous starts probing immediately — this keeps the NAT hole open
+	// while the peer reads the reply token and enters it.
+	result, err := punch.Simultaneous(conn, remote, func(msg string) {
+		fmt.Fprintf(os.Stderr, "\r  %s        ", msg)
+	})
+	fmt.Fprintln(os.Stderr) // newline after progress line
 	if err != nil {
-		return err
+		return punchError(err, diag)
 	}
 
 	fmt.Fprintln(os.Stderr, "Connected. Direct P2P. No server.\n")

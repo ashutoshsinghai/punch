@@ -302,11 +302,14 @@ func isPrivateIP(ip net.IP) bool {
 // Both peers must know each other's public IP:port in advance (via token
 // exchange) and call Simultaneous at roughly the same time.
 //
+// status is called every 5 seconds with a progress message while probing;
+// pass nil to suppress progress output.
+//
 // If both peers are on the same LAN (same public IP / NAT hairpin not
 // supported), it falls back to a LAN broadcast probe automatically —
 // no token format change required.
-func Simultaneous(conn *net.UDPConn, remote *net.UDPAddr) (*Result, error) {
-	const timeout = 10 * time.Minute
+func Simultaneous(conn *net.UDPConn, remote *net.UDPAddr, status func(string)) (*Result, error) {
+	const timeout = 45 * time.Second
 
 	// Enable broadcast so we can also probe 255.255.255.255:remote.Port
 	// for peers behind the same NAT.
@@ -320,12 +323,25 @@ func Simultaneous(conn *net.UDPConn, remote *net.UDPAddr) (*Result, error) {
 	probe := []byte(probeMsg)
 	buf := make([]byte, 512)
 
+	start := time.Now()
+	lastStatus := time.Time{} // zero → fire immediately on first tick
+
 	for time.Now().Before(deadline) {
 		select {
 		case <-ticker.C:
 			conn.WriteToUDP(probe, remote) //nolint:errcheck
 			conn.WriteToUDP(probe, bcast)  //nolint:errcheck — LAN fallback
 		default:
+		}
+
+		if status != nil && time.Since(lastStatus) >= 5*time.Second {
+			elapsed := int(time.Since(start).Seconds())
+			if elapsed == 0 {
+				status("probing peer...")
+			} else {
+				status(fmt.Sprintf("probing peer... (%ds)", elapsed))
+			}
+			lastStatus = time.Now()
 		}
 
 		conn.SetReadDeadline(time.Now().Add(probeInterval))
@@ -357,9 +373,5 @@ func Simultaneous(conn *net.UDPConn, remote *net.UDPAddr) (*Result, error) {
 	}
 
 	conn.Close()
-	return nil, fmt.Errorf(
-		"direct connection failed — symmetric NAT detected or peer unreachable.\n" +
-			"Ask your peer to try from a different network.\n" +
-			"(tried for %s)", timeout,
-	)
+	return nil, fmt.Errorf("hole punch timed out after %s", timeout)
 }

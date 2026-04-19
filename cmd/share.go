@@ -38,11 +38,13 @@ func runShare(_ *cobra.Command, _ []string) error {
 		return err
 	}
 
-	publicIP, publicPort, err := stun.Discover(conn)
+	diag, err := stun.CheckNAT(conn)
 	if err != nil {
 		return fmt.Errorf("STUN discovery failed: %w", err)
 	}
+	publicIP, publicPort := diag.PublicIP, diag.PublicPort
 	fmt.Fprintf(os.Stderr, "Your public address: %s:%d\n", publicIP, publicPort)
+	printNATDiag(diag)
 
 	payload, err := token.NewPayload(publicIP, publicPort)
 	if err != nil {
@@ -87,13 +89,61 @@ func runShare(_ *cobra.Command, _ []string) error {
 
 	fmt.Fprintln(os.Stderr, "\nPunching through NAT...")
 
-	result, err := punch.Simultaneous(conn, remote)
+	result, err := punch.Simultaneous(conn, remote, func(msg string) {
+		fmt.Fprintf(os.Stderr, "\r  %s        ", msg)
+	})
+	fmt.Fprintln(os.Stderr) // newline after progress line
 	if err != nil {
-		return err
+		return punchError(err, diag)
 	}
 
 	fmt.Fprintln(os.Stderr, "Connected. Direct P2P. No server.\n")
 	return runChat(result, payload.SessionHex(), myName, fmt.Sprintf("%s:%d", publicIP, publicPort))
+}
+
+// printNATDiag prints a one-line NAT status after STUN discovery.
+// It warns clearly if CGNAT or symmetric NAT is detected so the user
+// knows up-front why a connection might fail.
+func printNATDiag(diag *stun.NATDiag) {
+	switch {
+	case diag.IsCGNAT:
+		fmt.Fprintf(os.Stderr,
+			"NAT: CGNAT detected (your ISP is doing an extra layer of NAT)\n"+
+				"     IP %s is a shared ISP address — hole punching will likely fail.\n"+
+				"     Try switching to a mobile hotspot.\n",
+			diag.PublicIP)
+	case diag.IsSymmetric:
+		fmt.Fprintln(os.Stderr,
+			"NAT: Symmetric NAT detected — hole punching may fail.\n"+
+				"     Your router assigns a different port per destination.\n"+
+				"     Try switching to a mobile hotspot.")
+	default:
+		fmt.Fprintln(os.Stderr, "NAT: OK — hole punching should work.")
+	}
+}
+
+// punchError returns a descriptive error after Simultaneous times out,
+// incorporating the local NAT diagnostic so the user sees the real reason.
+func punchError(err error, diag *stun.NATDiag) error {
+	switch {
+	case diag.IsCGNAT:
+		return fmt.Errorf(
+			"connection failed: your ISP is using CGNAT (%s is not a true public IP).\n"+
+				"Hole punching cannot work through two layers of ISP NAT.\n"+
+				"Fix: switch to a mobile hotspot, or ask your ISP for a public IP.",
+			diag.PublicIP)
+	case diag.IsSymmetric:
+		return fmt.Errorf(
+			"connection failed: your router uses symmetric NAT.\n" +
+				"Each new destination gets a different external port, so the peer\n" +
+				"can't predict where to send packets.\n" +
+				"Fix: switch to a mobile hotspot, or change your router's NAT mode to 'Full Cone'.")
+	default:
+		return fmt.Errorf(
+			"connection failed: hole punch timed out.\n" +
+				"Your NAT type looks OK — the peer's NAT may be the problem.\n" +
+				"Ask them to run 'punch share' / 'punch join' and share their NAT status line.")
+	}
 }
 
 // offerClipboard prompts the user to copy text to the clipboard.
