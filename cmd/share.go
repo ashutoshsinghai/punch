@@ -7,7 +7,6 @@ import (
 	"os"
 	"strings"
 
-	"github.com/atotto/clipboard"
 	"github.com/ashutoshsinghai/punch/internal/punch"
 	"github.com/ashutoshsinghai/punch/internal/stun"
 	"github.com/ashutoshsinghai/punch/internal/token"
@@ -178,11 +177,7 @@ func printPunchFailReason(diag *stun.NATDiag) {
 	}
 }
 
-// offerClipboard silently copies text to the clipboard if available.
-// No keypress required — it either works and says so, or does nothing.
-func offerClipboard(text string) {
-	if err := clipboard.WriteAll(text); err == nil {
-		fmt.Println("(copied to clipboard)")
-	}
-}
+// offerClipboard is a no-op — clipboard interaction has been removed.
+// The token is printed on screen; users copy it manually.
+func offerClipboard(_ string) {}
 
