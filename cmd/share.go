@@ -12,7 +12,6 @@ import (
 	"github.com/ashutoshsinghai/punch/internal/stun"
 	"github.com/ashutoshsinghai/punch/internal/token"
 	"github.com/spf13/cobra"
-	"golang.org/x/term"
 )
 
 var shareFormat string
@@ -179,46 +178,11 @@ func printPunchFailReason(diag *stun.NATDiag) {
 	}
 }
 
-// offerClipboard prompts the user to copy text to the clipboard.
-// On systems without clipboard support (headless Linux without xclip/xsel/
-// wl-clipboard), the prompt is skipped silently rather than showing a
-// cryptic library error after the user has already pressed a key.
+// offerClipboard silently copies text to the clipboard if available.
+// No keypress required — it either works and says so, or does nothing.
 func offerClipboard(text string) {
-	// Probe availability without touching the actual clipboard content.
-	if _, err := clipboard.ReadAll(); err != nil {
-		fmt.Println()
-		return
-	}
-	fmt.Print("Press 'c' to copy to clipboard, any other key to skip: ")
-	if key := readSingleKey(); key == 'c' || key == 'C' {
-		if err := clipboard.WriteAll(text); err == nil {
-			fmt.Println("copied!")
-		} else {
-			fmt.Println()
-		}
-	} else {
-		fmt.Println()
+	if err := clipboard.WriteAll(text); err == nil {
+		fmt.Println("(copied to clipboard)")
 	}
 }
 
-// readSingleKey reads one keypress without requiring Enter.
-// Falls back to reading a full line if the terminal isn't a TTY.
-func readSingleKey() byte {
-	fd := int(os.Stdin.Fd())
-	if term.IsTerminal(fd) {
-		oldState, err := term.MakeRaw(fd)
-		if err == nil {
-			defer term.Restore(fd, oldState)
-			buf := make([]byte, 1)
-			os.Stdin.Read(buf) //nolint:errcheck
-			return buf[0]
-		}
-	}
-	// Fallback: read a line and return the first character.
-	reader := bufio.NewReader(os.Stdin)
-	line, _ := reader.ReadString('\n')
-	if len(strings.TrimSpace(line)) > 0 {
-		return line[0]
-	}
-	return 0
-}
