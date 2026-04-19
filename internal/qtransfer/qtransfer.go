@@ -23,8 +23,9 @@ package qtransfer
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
-	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/binary"
@@ -88,9 +89,11 @@ func tuneBuffers(conn net.PacketConn) {
 }
 
 // ServerTLSConfig generates a self-signed TLS config for the receiver (QUIC server side).
+// Uses ECDSA P-256 instead of RSA so key generation takes microseconds, not seconds —
+// this matters because it runs immediately after hole punching completes.
 // Auth comes from the session key already shared via the token.
 func ServerTLSConfig() (*tls.Config, error) {
-	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return nil, fmt.Errorf("generate key: %w", err)
 	}
@@ -103,7 +106,11 @@ func ServerTLSConfig() (*tls.Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create cert: %w", err)
 	}
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		return nil, fmt.Errorf("marshal key: %w", err)
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
 	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
 	cert, err := tls.X509KeyPair(certPEM, keyPEM)
 	if err != nil {
@@ -151,7 +158,8 @@ func Send(conn net.PacketConn, remote net.Addr, filePath string, progress func(i
 	ctx, cancel := context.WithTimeout(context.Background(), transferTimeout)
 	defer cancel()
 
-	qconn, err := quic.Dial(ctx, conn, remote, ClientTLSConfig(), nil)
+	qconf := &quic.Config{HandshakeIdleTimeout: 30 * time.Second}
+	qconn, err := quic.Dial(ctx, conn, remote, ClientTLSConfig(), qconf)
 	if err != nil {
 		return fmt.Errorf("QUIC dial: %w", err)
 	}
@@ -211,7 +219,8 @@ func Receive(conn net.PacketConn, savePath string, progress func(int64, int64)) 
 	ctx, cancel := context.WithTimeout(context.Background(), transferTimeout)
 	defer cancel()
 
-	ln, err := quic.Listen(conn, tlsConf, nil)
+	qconf := &quic.Config{HandshakeIdleTimeout: 30 * time.Second}
+	ln, err := quic.Listen(conn, tlsConf, qconf)
 	if err != nil {
 		return fmt.Errorf("QUIC listen: %w", err)
 	}
