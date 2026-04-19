@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/ashutoshsinghai/punch/internal/punch"
 	"github.com/ashutoshsinghai/punch/internal/stun"
@@ -103,8 +104,28 @@ func runShare(_ *cobra.Command, _ []string) error {
 	fmt.Println("Send this to your peer over WhatsApp/Signal.\n")
 	fmt.Print("Peer's reply token: ")
 
+	// Keep the NAT mapping alive while waiting for the reply token.
+	// Without this, NATs typically expire the UDP mapping after 30–60 s of
+	// idle, assigning a new external port when hole punching starts — making
+	// the address we encoded in the token stale and unreachable by the peer.
+	stunAddr, _ := net.ResolveUDPAddr("udp", stun.Server)
+	keepaliveDone := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(20 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				conn.WriteTo([]byte{0}, stunAddr) //nolint:errcheck // best-effort keepalive
+			case <-keepaliveDone:
+				return
+			}
+		}
+	}()
+
 	reader := bufio.NewReader(os.Stdin)
 	replyTok, err := reader.ReadString('\n')
+	close(keepaliveDone)
 	if err != nil {
 		return stepFail("token", "could not read reply token: "+err.Error())
 	}
