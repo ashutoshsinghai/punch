@@ -298,6 +298,14 @@ func isPrivateIP(ip net.IP) bool {
 	return false
 }
 
+// PunchDiag holds counters collected during a failed Simultaneous attempt.
+type PunchDiag struct {
+	TotalReceived int    // UDP packets received from any source
+	WrongSource   int    // packets with correct PUNCH payload but wrong source IP:port
+	WrongPayload  int    // packets from correct source but wrong payload
+	WrongSourceIP string // last seen source when WrongSource > 0
+}
+
 // Simultaneous performs true simultaneous UDP hole punching.
 // Both peers must know each other's public IP:port in advance (via token
 // exchange) and call Simultaneous at roughly the same time.
@@ -308,7 +316,7 @@ func isPrivateIP(ip net.IP) bool {
 // If both peers are on the same LAN (same public IP / NAT hairpin not
 // supported), it falls back to a LAN broadcast probe automatically —
 // no token format change required.
-func Simultaneous(conn *net.UDPConn, remote *net.UDPAddr, status func(string)) (*Result, error) {
+func Simultaneous(conn *net.UDPConn, remote *net.UDPAddr, status func(string)) (*Result, *PunchDiag, error) {
 	const timeout = 45 * time.Second
 
 	// Enable broadcast so we can also probe 255.255.255.255:remote.Port
@@ -325,6 +333,8 @@ func Simultaneous(conn *net.UDPConn, remote *net.UDPAddr, status func(string)) (
 
 	start := time.Now()
 	lastStatus := time.Time{} // zero → fire immediately on first tick
+
+	diag := &PunchDiag{}
 
 	for time.Now().Before(deadline) {
 		select {
@@ -350,13 +360,20 @@ func Simultaneous(conn *net.UDPConn, remote *net.UDPAddr, status func(string)) (
 			continue
 		}
 
-		if n < len(probeMsg) || string(buf[:len(probeMsg)]) != probeMsg {
+		diag.TotalReceived++
+		isPunch := n >= len(probeMsg) && string(buf[:len(probeMsg)]) == probeMsg
+		isExpected := from.String() == remote.String() || isPrivateIP(from.IP)
+
+		if isPunch && !isExpected {
+			diag.WrongSource++
+			diag.WrongSourceIP = from.String()
 			continue
 		}
-
-		// Accept the probe if it's from the expected public address OR
-		// from a private/LAN address (same-network fallback).
-		if from.String() != remote.String() && !isPrivateIP(from.IP) {
+		if !isPunch && isExpected {
+			diag.WrongPayload++
+			continue
+		}
+		if !isPunch || !isExpected {
 			continue
 		}
 
@@ -369,9 +386,9 @@ func Simultaneous(conn *net.UDPConn, remote *net.UDPAddr, status func(string)) (
 				time.Sleep(probeInterval)
 			}
 		}()
-		return &Result{Conn: tc, Local: local, Remote: from}, nil
+		return &Result{Conn: tc, Local: local, Remote: from}, diag, nil
 	}
 
 	conn.Close()
-	return nil, fmt.Errorf("hole punch timed out after %s", timeout)
+	return nil, diag, fmt.Errorf("hole punch timed out after %s", timeout)
 }

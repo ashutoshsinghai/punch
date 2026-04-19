@@ -147,12 +147,13 @@ func runShare(_ *cobra.Command, _ []string) error {
 	fmt.Fprintf(os.Stderr, "[   ] hole punch\n")
 	fmt.Fprintf(os.Stderr, "      → sending UDP probes to %s:%d every 200ms\n", replyPayload.IP, replyPayload.Port)
 
-	result, err := punch.Simultaneous(conn, remote, func(msg string) {
+	result, punchDiag, err := punch.Simultaneous(conn, remote, func(msg string) {
 		fmt.Fprintf(os.Stderr, "\r      → %s        ", msg)
 	})
 	fmt.Fprintln(os.Stderr)
 	if err != nil {
 		printPunchFailReason(diag)
+		printPacketDiag(punchDiag, fmt.Sprintf("%s:%d", replyPayload.IP, replyPayload.Port))
 		return stepFail("hole punch", "timed out — see diagnosis above")
 	}
 	stepOK("hole punch", "connected — direct P2P, no server")
@@ -205,6 +206,33 @@ func printPunchFailReason(diag *stun.NATDiag) {
 			"        your NAT looks fine (port-restricted, not symmetric, not CGNAT)\n"+
 				"        the peer's network is likely the problem\n"+
 				"        ask your peer to paste their full output — look at their NAT type lines")
+	}
+}
+
+// printPacketDiag prints what the socket actually received during hole punching,
+// so the user can tell whether packets are being dropped by the ISP or whether
+// there is a port mismatch.
+func printPacketDiag(d *punch.PunchDiag, expectedAddr string) {
+	fmt.Fprintln(os.Stderr, "      → packet diagnostic:")
+	if d.TotalReceived == 0 {
+		fmt.Fprintln(os.Stderr,
+			"        no UDP packets received at all\n"+
+				"        your ISP or the peer's ISP is dropping the traffic\n"+
+				"        this is common on Indian residential connections (Jio, Airtel, BSNL)\n"+
+				"        try: switch to a mobile hotspot — mobile data often bypasses this filter")
+	} else if d.WrongSource > 0 {
+		fmt.Fprintf(os.Stderr,
+			"        received %d packet(s) but from wrong address\n"+
+				"        expected: %s\n"+
+				"        got:      %s\n"+
+				"        your peer's NAT is remapping their port — symmetric NAT behaviour\n"+
+				"        try: switch to a mobile hotspot or set router NAT mode to Full Cone\n",
+			d.WrongSource, expectedAddr, d.WrongSourceIP)
+	} else {
+		fmt.Fprintf(os.Stderr,
+			"        received %d packet(s) from the right address but handshake never completed\n"+
+				"        this is unusual — please file a bug at https://github.com/ashutoshsinghai/punch\n",
+			d.TotalReceived)
 	}
 }
 

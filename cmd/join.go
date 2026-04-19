@@ -111,12 +111,13 @@ func runJoin(_ *cobra.Command, args []string) error {
 	fmt.Fprintf(os.Stderr, "\n[   ] hole punch\n")
 	fmt.Fprintf(os.Stderr, "      → sending UDP probes to %s:%d every 200ms\n", payload.IP, payload.Port)
 
-	result, err := punch.Simultaneous(conn, remote, func(msg string) {
+	result, punchDiag, err := punch.Simultaneous(conn, remote, func(msg string) {
 		fmt.Fprintf(os.Stderr, "\r      → %s        ", msg)
 	})
 	fmt.Fprintln(os.Stderr)
 	if err != nil {
 		printPunchFailReason(diag)
+		printPacketDiag(punchDiag, fmt.Sprintf("%s:%d", payload.IP, payload.Port))
 		return stepFail("hole punch", "timed out — see diagnosis above")
 	}
 	stepOK("hole punch", "connected — direct P2P, no server")
