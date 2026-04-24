@@ -2,6 +2,8 @@ package cmd
 
 import (
 	"bufio"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"net"
 	"os"
@@ -16,6 +18,7 @@ import (
 
 var shareFormat string
 var sharePort int
+var shareSession string
 
 var shareCmd = &cobra.Command{
 	Use:   "share",
@@ -26,6 +29,7 @@ var shareCmd = &cobra.Command{
 func init() {
 	shareCmd.Flags().StringVar(&shareFormat, "token", "words", "Token format: words | base58")
 	shareCmd.Flags().IntVar(&sharePort, "port", 0, "Local UDP port to bind (0 = random, try 3478 if direct connection fails)")
+	shareCmd.Flags().StringVar(&shareSession, "session", "", "Deterministic session (hex → low 2 bytes literal, e.g. 823c → 0x82 0x3c; non-hex → SHA-256 first 2 bytes)")
 	rootCmd.AddCommand(shareCmd)
 }
 
@@ -89,9 +93,14 @@ func runShare(_ *cobra.Command, _ []string) error {
 	}
 
 	// ── Step 3: Token exchange ────────────────────────────────────────────────
-	payload, err := token.NewPayload(publicIP, publicPort)
-	if err != nil {
-		return stepFail("token", err.Error())
+	var payload token.Payload
+	if s := strings.TrimSpace(shareSession); s != "" {
+		payload = token.Payload{IP: publicIP, Port: publicPort, Session: deriveSession(s)}
+	} else {
+		payload, err = token.NewPayload(publicIP, publicPort)
+		if err != nil {
+			return stepFail("token", err.Error())
+		}
 	}
 	tok, err := token.Encode(payload)
 	if err != nil {
@@ -241,4 +250,28 @@ func printPacketDiag(d *punch.PunchDiag, expectedAddr string) {
 // offerClipboard is a no-op — clipboard interaction has been removed.
 // The token is printed on screen; users copy it manually.
 func offerClipboard(_ string) {}
+
+// deriveSession turns --session input into 2 session bytes.
+//
+// Hex inputs are taken literally (low-order 2 bytes): "823c" → 0x82 0x3c,
+// "ff" → 0x00 0xff, "deadbeef" → 0xbe 0xef. Non-hex inputs fall back to
+// SHA-256 and take the first 2 bytes.
+func deriveSession(s string) [2]byte {
+	var session [2]byte
+	padded := s
+	if len(padded)%2 == 1 {
+		padded = "0" + padded
+	}
+	if b, err := hex.DecodeString(padded); err == nil && len(b) > 0 {
+		if len(b) >= 2 {
+			copy(session[:], b[len(b)-2:])
+		} else {
+			session[1] = b[0]
+		}
+		return session
+	}
+	h := sha256.Sum256([]byte(s))
+	copy(session[:], h[:2])
+	return session
+}
 
